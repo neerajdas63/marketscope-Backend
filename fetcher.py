@@ -13,11 +13,22 @@ import yfinance as yf
 from angel_client import get_bulk_ltp
 from stocks import ALL_SYMBOLS, SECTORS, FO_STOCKS, SCANNER_STOCKS
 from rfactor import calculate_rfactor_for_all
-from nse_fetcher import fetch_all_nse_data, fetch_all_nse_full_quotes
+from nse_fetcher import fetch_all_nse_data, fetch_all_nse_full_quotes, fetch_nse_index_quotes
 from intraday_boost import calculate_intraday_boost
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
+
+
+def _get_sector_index_change_pct(
+    sector_name: str,
+    official_indices: Dict[str, Dict[str, Any]],
+    fallback_change_pct: float,
+) -> float:
+    official = official_indices.get(sector_name) or official_indices.get(sector_name.strip())
+    if official:
+        return round(float(official.get("percentChange", fallback_change_pct) or fallback_change_pct), 2)
+    return round(fallback_change_pct, 2)
 
 
 def _is_market_open() -> bool:
@@ -267,6 +278,14 @@ def fetch_all_sectors() -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"Angel LTP fetch failed: {e}")
 
+    logger.info("Fetching official NSE sector indices...")
+    official_indices: Dict[str, Dict[str, Any]] = {}
+    try:
+        official_indices = fetch_nse_index_quotes()
+        logger.info("Official NSE indices received for %d entries.", len(official_indices))
+    except Exception as e:
+        logger.warning(f"NSE index quote fetch failed: {e}")
+
     # STEP 2 — Daily yfinance: 20-day volume average baseline (fast; 1d interval, 5d period)
     logger.info(f"Downloading daily data for volume baseline ({len(ALL_SYMBOLS)} symbols)...")
     daily_data = yf.download(
@@ -409,7 +428,8 @@ def fetch_all_sectors() -> Dict[str, Any]:
             continue
 
         stocks.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
-        sector_pct = round(sum(s["change_pct"] for s in stocks) / len(stocks), 2)
+        fallback_sector_pct = round(sum(s["change_pct"] for s in stocks) / len(stocks), 2)
+        sector_pct = _get_sector_index_change_pct(sector_name, official_indices, fallback_sector_pct)
         sectors_result.append({
             "name": sector_name,
             "change_pct": sector_pct,

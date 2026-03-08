@@ -488,11 +488,9 @@ def take_snapshot(sectors_data: List[Dict[str, Any]]) -> None:
             continue
 
         try:
-            avg_change = round(
-                mean(float(s.get("change_pct") or 0.0) for s in stocks), 2
-            )
+            avg_change = round(float(sector.get("change_pct") or 0.0), 2)
         except Exception as exc:
-            logger.warning("Momentum: failed avg for %s: %s", name, exc)
+            logger.warning("Momentum: failed official change for %s: %s", name, exc)
             avg_change = 0.0
 
         _momentum_data.setdefault(name, {})[slot] = avg_change
@@ -526,9 +524,7 @@ def _build_eod_snapshot() -> None:
             if not stocks or not name:
                 continue
             try:
-                avg_change = round(
-                    mean(float(s.get("change_pct") or 0.0) for s in stocks), 2
-                )
+                avg_change = round(float(sector.get("change_pct") or 0.0), 2)
             except Exception:
                 avg_change = 0.0
             _momentum_data[name] = {"EOD": avg_change}

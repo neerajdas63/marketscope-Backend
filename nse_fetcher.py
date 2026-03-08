@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -38,6 +38,7 @@ _BASE_HEADERS = {
 _COOKIE_URL      = "https://www.nseindia.com/"
 _QUOTE_PAGE_URL  = "https://www.nseindia.com/get-quotes/equity?symbol=RELIANCE"  # warm-up for quote API cookies
 _QUOTE_URL       = "https://www.nseindia.com/api/quote-equity"
+_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
 _OC_PAGE_URL     = "https://www.nseindia.com/option-chain"  # warm-up URL for OC cookies
 _OC_INDICES_URL  = "https://www.nseindia.com/api/option-chain-indices"
 
@@ -429,3 +430,60 @@ def fetch_nse_data_for_all(fo_symbols: list) -> Dict[str, dict]:
 # Backward-compat shim (previously only returned ltp/change_pct/prev_close)
 def fetch_all_nse_quotes(symbols: list) -> Dict[str, dict]:
     return fetch_all_nse_full_quotes(symbols)
+
+
+def fetch_nse_index_quotes() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch official NSE index quotes from /api/allIndices.
+
+    Returns a dict keyed by index name/indexSymbol with values containing:
+        index, indexSymbol, last, variation, percentChange
+    Returns {} on failure.
+    """
+    session = _get_session()
+    attempts = 2
+
+    for attempt in range(attempts):
+        try:
+            resp = session.get(_ALL_INDICES_URL, timeout=10)
+            if resp.status_code in (401, 403):
+                logger.warning("NSE %s for allIndices%s", resp.status_code, " — retrying" if attempt == 0 else "")
+                _reset_session()
+                session = _get_session()
+                continue
+            if resp.status_code != 200:
+                return {}
+            if not resp.content or not resp.content.strip():
+                logger.warning("NSE empty body for allIndices")
+                if attempt == 0:
+                    _reset_session()
+                    session = _get_session()
+                    continue
+                return {}
+
+            payload = resp.json() or {}
+            rows = payload.get("data", []) or []
+            results: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("indexSymbol") or row.get("index") or "").strip()
+                if not key:
+                    continue
+                item = {
+                    "index": str(row.get("index") or key).strip(),
+                    "indexSymbol": key,
+                    "last": float(row.get("last") or 0.0),
+                    "variation": float(row.get("variation") or 0.0),
+                    "percentChange": round(float(row.get("percentChange") or 0.0), 2),
+                }
+                results[key] = item
+                results.setdefault(item["index"], item)
+            return results
+        except Exception as exc:
+            logger.warning("NSE allIndices fetch failed: %s", exc)
+            if attempt == 0:
+                _reset_session()
+                session = _get_session()
+
+    return {}
