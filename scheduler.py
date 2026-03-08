@@ -69,9 +69,9 @@ async def scheduled_fetch(cache_obj: "InMemoryCache") -> None:
             from stocks import FO_STOCKS
             from oi_analysis import refresh_fo_radar_cache
             fo_clean = [s.replace(".NS", "") for s in FO_STOCKS]
-            sectors_data = data.get("sectors", [])
+            scanner_stocks = data.get("scanner_stocks", [])
             _radar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar")
-            loop.run_in_executor(_radar_executor, refresh_fo_radar_cache, fo_clean, sectors_data)
+            loop.run_in_executor(_radar_executor, refresh_fo_radar_cache, fo_clean, scanner_stocks)
             logger.info("F&O Radar background refresh started (%d symbols).", len(fo_clean))
         except Exception as radar_exc:
             logger.warning("F&O Radar refresh could not start: %s", radar_exc)

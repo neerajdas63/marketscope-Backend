@@ -83,24 +83,58 @@ def _momentum_snapshot_job() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background startup helpers
+# ---------------------------------------------------------------------------
+
+async def _bg_init_fetch() -> None:
+    """Run the initial market data fetch, then kick off the F&O radar OI refresh."""
+    try:
+        logger.info("[BG] Starting initial market data fetch...")
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mscope-init") as ex:
+            initial_data = await loop.run_in_executor(ex, fetch_all_sectors)
+        cache.set(initial_data)
+        logger.info("[BG] Initial fetch completed successfully.")
+    except Exception as exc:
+        logger.error(f"[BG] Initial fetch failed: {exc}", exc_info=True)
+        return  # Don't attempt radar refresh if fetch failed
+
+    # Immediately seed the F&O Radar OI cache in its own background thread.
+    # This runs after the initial fetch so stock price data is already available.
+    try:
+        from stocks import FO_STOCKS
+        fo_clean          = [s.replace(".NS", "") for s in FO_STOCKS]
+        scanner_stocks    = cache.get().get("scanner_stocks", [])
+        loop              = asyncio.get_running_loop()
+        _radar_ex         = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar-init")
+        loop.run_in_executor(_radar_ex, refresh_fo_radar_cache, fo_clean, scanner_stocks)
+        logger.info("[BG] F&O Radar OI refresh started in background (%d symbols).", len(fo_clean))
+    except Exception as exc:
+        logger.warning("[BG] Could not start F&O Radar refresh: %s", exc)
+
+
+async def _bg_backfill() -> None:
+    """Backfill opening momentum slots after a post-open server start."""
+    try:
+        logger.info("[BG] Backfilling opening momentum slots...")
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mscope-backfill") as ex:
+            await loop.run_in_executor(ex, backfill_today_snapshots)
+        logger.info("[BG] Backfill done.")
+        if _is_momentum_window():
+            logger.info("[BG] Still inside momentum window — taking live catch-up snapshot.")
+            _momentum_snapshot_job()
+    except Exception as exc:
+        logger.error(f"[BG] Backfill failed: {exc}", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Lifespan (startup / shutdown)
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run startup tasks before yielding control, then clean up on shutdown."""
+    """Start the server immediately; heavy fetches run in the background."""
     logger.info("MarketScope starting...")
-
-    # Perform an initial data fetch so the cache is warm before accepting requests.
-    # Run in a thread executor so the async event loop is not blocked during startup.
-    try:
-        logger.info("Running initial market data fetch (background thread)...")
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mscope-init") as ex:
-            initial_data = await loop.run_in_executor(ex, fetch_all_sectors)
-        cache.set(initial_data)
-        logger.info("Initial fetch completed successfully.")
-    except Exception as exc:
-        logger.error(f"Initial fetch failed (server will still start): {exc}", exc_info=True)
 
     # Give sector_momentum a reference to the cache for EOD fallback snapshots
     momentum_set_cache_ref(cache)
@@ -122,22 +156,22 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Sector momentum snapshot job registered (cron-aligned).")
 
-    # Catch-up: if server started after 9:15 on a trading day, backfill all elapsed
-    # slots from today's intraday data so the Opening tracker is fully populated.
+    # Fire the initial fetch in the background — server becomes available immediately.
+    # The /heatmap endpoint returns {"error": "Data not available yet"} until this completes.
+    _init_task = asyncio.create_task(_bg_init_fetch())
+
+    # Catch-up backfill also runs in the background if started after market open.
     if _is_after_open_today():
-        logger.info("Server started after market open — backfilling opening slots...")
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mscope-backfill") as ex:
-            await loop.run_in_executor(ex, backfill_today_snapshots)
-        logger.info("Backfill done.")
-        # Only take a live snapshot if we're still inside the 9:15–10:00 window
-        if _is_momentum_window():
-            logger.info("Still inside momentum window — taking live catch-up snapshot.")
-            _momentum_snapshot_job()
+        logger.info("Server started after market open — scheduling background backfill...")
+        asyncio.create_task(_bg_backfill())
 
-    yield  # Application is now running
+    logger.info("MarketScope startup complete — server is ready. (Initial fetch running in background)")
 
-    # Graceful shutdown
+    yield  # Application is now running and accepting requests
+
+    # Graceful shutdown — cancel any still-running init task
+    if not _init_task.done():
+        _init_task.cancel()
     logger.info("MarketScope shutting down...")
     scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped.")
@@ -223,15 +257,8 @@ async def get_rfactor(
     if not cached:
         raise HTTPException(status_code=503, detail="Data not ready")
 
-    # Flatten all stocks from all sectors, deduplicate by symbol (keep highest rfactor)
-    seen: Dict[str, Any] = {}
-    for sector in cached["sectors"]:
-        for stock in sector["stocks"]:
-            sym = stock["symbol"]
-            if sym not in seen or stock.get("rfactor", 0) > seen[sym].get("rfactor", 0):
-                seen[sym] = {**stock, "sector": sector["name"]}
-
-    all_stocks = list(seen.values())
+    # Use the scanner_stocks universe (not heatmap sectors)
+    all_stocks = list(cached.get("scanner_stocks", []))
 
     # Apply filters
     if fo_only:
@@ -274,15 +301,8 @@ async def get_scanner(
     if not cached:
         raise HTTPException(status_code=503, detail="Data not ready")
 
-    # Flatten all stocks, deduplicate by symbol (keep first occurrence)
-    seen: set = set()
-    all_stocks = []
-    for sector in cached["sectors"]:
-        for stock in sector["stocks"]:
-            sym = stock["symbol"]
-            if sym not in seen:
-                seen.add(sym)
-                all_stocks.append({**stock, "sector": sector["name"]})
+    # Use the scanner_stocks universe (not heatmap sectors)
+    all_stocks = list(cached.get("scanner_stocks", []))
 
     # Apply filters
     if fo_only:
@@ -347,15 +367,8 @@ async def get_intraday_boost(
     if not cached:
         raise HTTPException(status_code=503, detail="Data not ready")
 
-    # Flatten and deduplicate by symbol (keep highest boost_score)
-    seen: Dict[str, Any] = {}
-    for sector in cached["sectors"]:
-        for stock in sector["stocks"]:
-            sym = stock["symbol"]
-            if sym not in seen or stock.get("boost_score", 0) > seen[sym].get("boost_score", 0):
-                seen[sym] = {**stock, "sector": sector["name"]}
-
-    all_stocks = list(seen.values())
+    # Use the scanner_stocks universe (not heatmap sectors)
+    all_stocks = list(cached.get("scanner_stocks", []))
 
     if fo_only:
         all_stocks = [s for s in all_stocks if s.get("fo")]
@@ -429,7 +442,7 @@ async def get_sector_scope(
 
 
 def get_symbols() -> Dict[str, Any]:
-    """Build a flat sym_data dict from cached sectors (deduped by symbol)."""
+    """Build a flat sym_data dict from cached sectors (heatmap — deduped by symbol)."""
     cached = cache.get()
     if not cached:
         return {}
@@ -439,6 +452,19 @@ def get_symbols() -> Dict[str, Any]:
             sym = stock.get("symbol")
             if sym and sym not in sym_data:
                 sym_data[sym] = stock
+    return sym_data
+
+
+def get_scanner_symbols() -> Dict[str, Any]:
+    """Build a flat sym_data dict from the scanner_stocks cache (used by scanner/boost/rfactor/planner/fo-radar)."""
+    cached = cache.get()
+    if not cached:
+        return {}
+    sym_data: Dict[str, Any] = {}
+    for stock in cached.get("scanner_stocks", []):
+        sym = stock.get("symbol")
+        if sym and sym not in sym_data:
+            sym_data[sym] = stock
     return sym_data
 
 
@@ -660,7 +686,7 @@ def trade_plan_bulk_endpoint(direction: str = "") -> Dict[str, Any]:
     Optional ?direction=LONG or ?direction=SHORT to filter.
     Sorted by confidence (HIGH first) then R:R then RFactor descending.
     """
-    sym_data = get_symbols()
+    sym_data = get_scanner_symbols()
     if not sym_data:
         raise HTTPException(status_code=503, detail="Data not ready")
     try:
@@ -682,7 +708,7 @@ def trade_plan_bulk_endpoint(direction: str = "") -> Dict[str, Any]:
 @app.get("/api/trade-plan/{symbol}", summary="Trade plan for a single stock", tags=["Trade Planner"])
 def trade_plan_single_endpoint(symbol: str) -> Dict[str, Any]:
     """Returns a trade plan for a single stock symbol."""
-    sym_data = get_symbols()
+    sym_data = get_scanner_symbols()
     if not sym_data:
         raise HTTPException(status_code=503, detail="Data not ready")
     clean = symbol.upper().replace(".NS", "")
@@ -762,14 +788,12 @@ def fo_radar_endpoint(
         # Cache exists but radar hasn't run yet — trigger a quick price-action-only snapshot
         try:
             from stocks import FO_STOCKS
-            sectors_data = cached.get("sectors", [])
-            # Build price-action-only entries without OI (fast)
+            # Build price-action-only entries from scanner_stocks (not heatmap sectors)
             stock_map: Dict[str, Any] = {}
-            for sector in sectors_data:
-                for s in sector.get("stocks", []):
-                    sym = s.get("symbol", "")
-                    if sym:
-                        stock_map[sym] = {**s, "sector": sector.get("name", "")}
+            for s in cached.get("scanner_stocks", []):
+                sym = s.get("symbol", "")
+                if sym:
+                    stock_map[sym] = s
             from oi_analysis import compute_fo_trade_signal
             clean_fo = [s.replace(".NS", "") for s in FO_STOCKS]
             stocks = [
@@ -823,14 +847,15 @@ async def fo_radar_refresh_endpoint() -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="Main cache not ready.")
     from stocks import FO_STOCKS
     fo_clean = [s.replace(".NS", "") for s in FO_STOCKS]
-    sectors_data = cached.get("sectors", [])
-    loop = asyncio.get_event_loop()
+    # Use scanner_stocks for price data (not heatmap sectors)
+    scanner_stocks_data = cached.get("scanner_stocks", [])
+    loop = asyncio.get_running_loop()
     _radar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar")
     loop.run_in_executor(
         _radar_executor,
         refresh_fo_radar_cache,
         fo_clean,
-        sectors_data,
+        scanner_stocks_data,
     )
     return {"status": "refresh_started", "symbols": len(fo_clean)}
 
@@ -845,5 +870,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
-        reload=True,
+        reload=False,  # reload=True causes infinite restart loop on Windows (watchfiles respawns before startup completes)
     )

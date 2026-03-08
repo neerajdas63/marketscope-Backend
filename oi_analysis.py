@@ -406,7 +406,7 @@ def compute_fo_trade_signal(oi_data: dict, stock_data: dict) -> dict:
     }
 
 
-def refresh_fo_radar_cache(fo_symbols: List[str], sectors_data: List[Dict]) -> None:
+def refresh_fo_radar_cache(fo_symbols: List[str], price_data: List[Dict]) -> None:
     """
     Background job: fetch OI for all F&O symbols sequentially, merge with cache,
     compute trade signals, and store result in _fo_radar_cache.
@@ -415,18 +415,27 @@ def refresh_fo_radar_cache(fo_symbols: List[str], sectors_data: List[Dict]) -> N
 
     Parameters
     ----------
-    fo_symbols  : list of clean symbol strings from FO_STOCKS (no .NS suffix)
-    sectors_data: cache["sectors"] list from the main MarketScope cache
+    fo_symbols : list of clean symbol strings from FO_STOCKS (no .NS suffix)
+    price_data : flat list of stock dicts (scanner_stocks) — each dict has
+                 symbol, ltp, change_pct, rsi, vwap, etc.
     """
     global _fo_radar_cache, _fo_radar_cache_at
 
-    # Build a flat symbol → stock dict from the sectors cache for quick lookup
+    # Build a flat symbol → stock dict for quick lookup.
+    # Accepts both flat stock lists and legacy sector-grouped lists.
     stock_map: Dict[str, Dict] = {}
-    for sector in sectors_data:
-        for stock in sector.get("stocks", []):
-            sym = stock.get("symbol", "")
+    for item in price_data:
+        if "stocks" in item:
+            # Legacy sector-grouped format
+            for stock in item.get("stocks", []):
+                sym = stock.get("symbol", "")
+                if sym:
+                    stock_map[sym] = {**stock, "sector": item.get("name", "")}
+        else:
+            # Flat stock dict (scanner_stocks format)
+            sym = item.get("symbol", "")
             if sym:
-                stock_map[sym] = {**stock, "sector": sector.get("name", "")}
+                stock_map[sym] = item
 
     # Only process symbols that exist in the cache (have price data)
     symbols_to_fetch = [s for s in fo_symbols if s in stock_map]

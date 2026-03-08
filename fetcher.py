@@ -10,7 +10,7 @@ import pandas as pd
 import pytz
 import yfinance as yf
 
-from stocks import ALL_SYMBOLS, SECTORS, FO_STOCKS
+from stocks import ALL_SYMBOLS, SECTORS, FO_STOCKS, SCANNER_STOCKS
 from rfactor import calculate_rfactor_for_all
 from nse_fetcher import fetch_all_nse_data, fetch_all_nse_full_quotes
 from intraday_boost import calculate_intraday_boost
@@ -223,8 +223,10 @@ def fetch_all_sectors() -> Dict[str, Any]:
     """
     start = time.time()
 
-    all_syms_str  = " ".join(ALL_SYMBOLS)
-    clean_symbols = [s.replace(".NS", "") for s in ALL_SYMBOLS]
+    # Combined unique symbols: heatmap sectors + scanner universe
+    _combined_symbols = list({sym for sym in ALL_SYMBOLS + SCANNER_STOCKS})
+    all_syms_str  = " ".join(_combined_symbols)
+    clean_symbols = [s.replace(".NS", "") for s in _combined_symbols]
 
     def get_sym_df(data, symbol):
         """Extract a single symbol's DataFrame from a (possibly multi-ticker) download result."""
@@ -278,7 +280,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     # STEP 4 — Build sym_data: primary values from NSE, volume_ratio from yfinance daily
     sym_data: Dict[str, Any] = {}
-    for symbol in ALL_SYMBOLS:
+    for symbol in _combined_symbols:
         try:
             clean = symbol.replace(".NS", "")
             q = nse_full.get(clean)
@@ -359,7 +361,16 @@ def fetch_all_sectors() -> Dict[str, Any]:
     for stock in sym_data.values():
         calculate_vwap_bands(stock)
 
-    # STEP 4 — Build sector results from sym_data
+    # Build scanner flat list from SCANNER_STOCKS
+    scanner_stocks_result: List[Dict[str, Any]] = []
+    for sym in SCANNER_STOCKS:
+        clean = sym.replace(".NS", "")
+        if clean in sym_data:
+            scanner_stocks_result.append(sym_data[clean])
+    scanner_stocks_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+    logger.info(f"Scanner stocks assembled: {len(scanner_stocks_result)}/{len(SCANNER_STOCKS)} symbols.")
+
+    # STEP 4 — Build sector results from sym_data (heatmap only)
     sectors_result: List[Dict[str, Any]] = []
     for sector_name, sector_symbols in SECTORS.items():
         stocks = []
@@ -396,6 +407,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     return {
         "sectors": sectors_result,
+        "scanner_stocks": scanner_stocks_result,
         "last_updated": now_ist.strftime("%H:%M:%S"),
         "market_open": market_open,
     }

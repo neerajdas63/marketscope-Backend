@@ -38,6 +38,8 @@ _BASE_HEADERS = {
 _COOKIE_URL      = "https://www.nseindia.com/"
 _QUOTE_PAGE_URL  = "https://www.nseindia.com/get-quotes/equity?symbol=RELIANCE"  # warm-up for quote API cookies
 _QUOTE_URL       = "https://www.nseindia.com/api/quote-equity"
+_OC_PAGE_URL     = "https://www.nseindia.com/option-chain"  # warm-up URL for OC cookies
+_OC_INDICES_URL  = "https://www.nseindia.com/api/option-chain-indices"
 
 # Separate budget for bulk real-time quote fetching (all symbols, not just F&O)
 _QUOTE_ALL_BUDGET_SECS: float = 90.0
@@ -50,11 +52,10 @@ _session_created_at: float = 0.0
 _SESSION_TTL: float = 240.0  # refresh every 4 min — forces rebuild between 5-min scheduler cycles
 _session_lock = threading.Lock()  # prevents thundering-herd on concurrent session creation
 
-# Separate session for option-chain API — requires visiting /option-chain page for cookies
-_oi_session: Optional[requests.Session] = None
+# Separate session for option-chain API — uses curl_cffi (Chrome TLS fingerprint) to bypass Akamai
+_oi_session = None  # curl_cffi.Session or requests.Session depending on availability
 _oi_session_created_at: float = 0.0
 _oi_session_lock = threading.Lock()
-_OC_PAGE_URL = "https://www.nseindia.com/option-chain"  # warm-up URL for OC cookies
 
 
 # ── Session management ─────────────────────────────────────────────────────────
@@ -88,28 +89,28 @@ def _build_session() -> requests.Session:
 
 def _build_oi_session() -> requests.Session:
     """
-    Create a session specifically for the NSE option-chain API.
+    Create a session for the NSE option-chain API.
 
-    The OC API endpoint (/api/option-chain-equities and -indices) requires
-    cookies that are only set when the browser visits the /option-chain HTML
-    page first.  Visiting just the homepage is not enough — that's why every
-    OC request returns 403 when using the regular _session.
+    NOTE: NSE's Akamai Bot Manager blocks all programmatic access to the
+    option-chain endpoint (/api/option-chain-equities) — plain requests,
+    curl_cffi TLS impersonation, and headless Playwright all return either
+    {} or ERR_HTTP2_PROTOCOL_ERROR.  Only a real interactive browser with
+    full JavaScript execution passes the challenge.
 
-    Warm-up sequence:
-        1. GET https://www.nseindia.com/          → base cookies (nseappid, etc.)
-        2. pause 1.5 s  (simulate human reading)
-        3. GET https://www.nseindia.com/option-chain → OC-specific cookies
-        4. pause 1.0 s  (simulate page load)
+    This function builds the best session we can without a real browser.
+    It will work occasionally (e.g. when NSE relaxes bot detection outside
+    market hours) but will often return {} during live trading.
     """
     s = requests.Session()
     s.headers.update(_BASE_HEADERS)
     try:
-        s.get(_COOKIE_URL, timeout=10)          # step 1: base cookies
-        time.sleep(1.5)                          # step 2: human-like pause
+        s.get(_COOKIE_URL, timeout=10)
+        time.sleep(1.5)
         s.headers.update({"Referer": "https://www.nseindia.com/"})
-        s.get(_OC_PAGE_URL, timeout=10)         # step 3: OC-specific cookies
-        time.sleep(1.0)                          # step 4: let page settle
-        logger.info("NSE OI session initialised (option-chain cookies acquired).")
+        s.get(_OC_PAGE_URL, timeout=10)
+        time.sleep(1.0)
+        s.headers.update({"Referer": "https://www.nseindia.com/option-chain"})
+        logger.info("NSE OI session initialised.")
     except Exception as e:
         logger.warning(f"NSE OI session warm-up failed: {e}")
     return s
@@ -194,13 +195,13 @@ def fetch_nse_delivery(symbol: str) -> dict:
 
         if resp.status_code in (401, 403):
             logger.warning(f"NSE {resp.status_code} for {symbol} (trade_info) — skipping.")
-            return result
+            return {}
         if resp.status_code != 200:
-            return result
+            return {}
         # NSE silent-fail: returns HTTP 200 with empty body when session is stale
         if not resp.content or not resp.content.strip():
             logger.warning(f"NSE returned empty body for {symbol} — skipping.")
-            return result
+            return {}
 
         data = resp.json()
 
