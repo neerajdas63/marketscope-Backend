@@ -313,7 +313,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
         timeout=30,
     )
 
-    # STEP 4 — Build sym_data: primary values from NSE, volume_ratio from yfinance daily
+    # STEP 4 — Build sym_data: primary values from SmartAPI, volume_ratio from yfinance daily
     sym_data: Dict[str, Any] = {}
     for symbol in _combined_symbols:
         try:
@@ -336,6 +336,12 @@ def fetch_all_sectors() -> Dict[str, Any]:
                     "symbol": clean, "ltp": ltp_fb, "change_pct": change_fb,
                     "volume_ratio": 1.0, "fo": clean in FO_STOCKS,
                     "day_high": ltp_fb, "day_low": ltp_fb, "day_open": ltp_fb, "vwap": 0.0,
+                    "quote_source": "yfinance_fallback" if not angel_price else "angel_ltp_fallback",
+                    "delivery_source": "unavailable_fallback",
+                    "delivery_pct": None,
+                    "bid_ask_ratio": None,
+                    "bid_qty": None,
+                    "ask_qty": None,
                 }
                 continue
 
@@ -367,36 +373,38 @@ def fetch_all_sectors() -> Dict[str, Any]:
                 "change_pct":   change_pct,
                 "volume_ratio": vol_ratio,
                 "fo":           clean in FO_STOCKS,
-                # NSE live intraday fields — used by rfactor price_action and boost
+                # Live intraday fields — used by rfactor price_action and boost
                 "day_high":     q.get("day_high",  live_ltp or q["ltp"]),
                 "day_low":      q.get("day_low",   live_ltp or q["ltp"]),
                 "day_open":     q.get("day_open",  live_ltp or q["ltp"]),
                 "vwap":         q.get("vwap",       0.0),
                 # Delivery & bid-ask written here directly so they survive even if rfactor skips
-                "delivery_pct":  round(float(q.get("delivery_pct",  0) or 0), 1) or None,
-                "bid_ask_ratio": round(float(q.get("bid_ask_ratio", 0) or 0), 2) or None,
-                "bid_qty":       q.get("bid_qty",  0),
-                "ask_qty":       q.get("ask_qty",  0),
+                "quote_source":  q.get("quote_source", "smartapi_full"),
+                "delivery_source": q.get("delivery_source", "unknown"),
+                "delivery_pct":  round(float(q.get("delivery_pct", 0) or 0), 1) if q.get("delivery_pct") is not None else None,
+                "bid_ask_ratio": round(float(q.get("bid_ask_ratio", 0) or 0), 2) if q.get("bid_qty") or q.get("ask_qty") else None,
+                "bid_qty":       q.get("bid_qty") if q.get("bid_qty") or q.get("ask_qty") else None,
+                "ask_qty":       q.get("ask_qty") if q.get("bid_qty") or q.get("ask_qty") else None,
             }
 
         except Exception as e:
             logger.warning(f"Skipping {symbol}: {e}")
             continue
 
-    logger.info(f"sym_data built for {len(sym_data)} symbols (NSE primary, yfinance fallback).")
+    logger.info(f"sym_data built for {len(sym_data)} symbols (SmartAPI primary, yfinance fallback).")
 
-    # STEP 5 — nse_data for rfactor (delivery%, bid/ask) — sourced from nse_full
+    # STEP 5 — quote depth data for rfactor (delivery%, bid/ask) — sourced from live quotes
     nse_data: Dict[str, Any] = {
         sym: {
-            "delivery_pct":  q.get("delivery_pct",  0.0),
-            "bid_ask_ratio": q.get("bid_ask_ratio",  1.0),
-            "bid_qty":       q.get("bid_qty",         0),
-            "ask_qty":       q.get("ask_qty",          0),
+            "delivery_pct":  q.get("delivery_pct") or 0.0,
+            "bid_ask_ratio": q.get("bid_ask_ratio") or 1.0,
+            "bid_qty":       q.get("bid_qty") or 0,
+            "ask_qty":       q.get("ask_qty") or 0,
         }
         for sym, q in nse_full.items()
     }
     if not nse_data:
-        logger.warning("NSE data empty — rfactor will use neutral delivery/bid values.")
+        logger.warning("Live depth data empty — rfactor will use neutral delivery/bid values.")
 
     sym_data = calculate_rfactor_for_all(sym_data, None, data_15min, nse_data)
     sym_data = calculate_intraday_boost(sym_data, None, daily_data)

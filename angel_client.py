@@ -387,7 +387,9 @@ def get_bulk_full_quotes(symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
             "bid_qty":            tot_buy,
             "ask_qty":            tot_sell,
             "bid_ask_ratio":      round(tot_buy / tot_sell, 2) if tot_sell > 0 else 1.0,
-            "delivery_pct":       0.0,  # not available from SmartAPI
+            "delivery_pct":       None,
+            "quote_source":       "smartapi_full",
+            "delivery_source":    "unavailable_smartapi",
         }
     return result
 
