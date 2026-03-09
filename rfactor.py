@@ -310,12 +310,52 @@ def _proximity_for_side(close: float, levels: List[BreakoutLevel], side: str) ->
 
 
 def _compression_score(session_df: Optional[pd.DataFrame], atr_value: float) -> float:
-    if session_df is None or len(session_df) < 8 or atr_value <= 0:
+    if session_df is None or len(session_df) < 14 or atr_value <= 0:
         return 0.0
-    recent = session_df.tail(min(8, len(session_df)))
+    recent = session_df.tail(6)
+    prior = session_df.iloc[: -len(recent)].tail(12)
+    if len(prior) < 6:
+        return 0.0
+
     recent_range = _safe_float(recent["High"].max()) - _safe_float(recent["Low"].min())
-    normalized = recent_range / max(atr_value * max(len(recent) / 2.5, 1.0), 1e-6)
-    return round(100.0 * (1.0 - _clamp((normalized - 0.8) / 1.6)), 1)
+    prior_range = _safe_float(prior["High"].max()) - _safe_float(prior["Low"].min())
+    if recent_range <= 0 or prior_range <= 0:
+        return 0.0
+
+    recent_bar_range = pd.Series(recent["High"] - recent["Low"], dtype="float64").replace(0.0, np.nan)
+    prior_bar_range = pd.Series(prior["High"] - prior["Low"], dtype="float64").replace(0.0, np.nan)
+    recent_close = pd.Series(recent["Close"], dtype="float64")
+    prior_close = pd.Series(prior["Close"], dtype="float64")
+    recent_std = _safe_float(recent_close.pct_change().dropna().std(ddof=0))
+    prior_std = _safe_float(prior_close.pct_change().dropna().std(ddof=0), recent_std)
+
+    range_ratio = recent_range / max(prior_range, 1e-6)
+    bar_ratio = _safe_float(recent_bar_range.mean()) / max(_safe_float(prior_bar_range.mean(), 1e-6), 1e-6)
+    std_ratio = recent_std / max(prior_std, 1e-6) if prior_std > 0 else 1.0
+    atr_ratio = recent_range / max(atr_value * 2.8, 1e-6)
+
+    prior_high = _safe_float(prior["High"].max())
+    prior_low = _safe_float(prior["Low"].min())
+    recent_high = _safe_float(recent["High"].max())
+    recent_low = _safe_float(recent["Low"].min())
+    overflow = max(0.0, recent_high - prior_high) + max(0.0, prior_low - recent_low)
+
+    range_tight = 1.0 - _clamp((range_ratio - 0.34) / 0.86)
+    bar_tight = 1.0 - _clamp((bar_ratio - 0.42) / 0.85)
+    std_tight = 1.0 - _clamp((std_ratio - 0.50) / 0.90)
+    atr_tight = 1.0 - _clamp((atr_ratio - 0.75) / 1.00)
+    inside_tight = 1.0 - _clamp(overflow / max(prior_range * 0.35, atr_value * 0.8, 1e-6))
+    consistency = min(range_tight, bar_tight, std_tight, atr_tight)
+
+    raw = (
+        range_tight * 0.34
+        + bar_tight * 0.24
+        + std_tight * 0.18
+        + atr_tight * 0.14
+        + inside_tight * 0.10
+    )
+    raw *= 0.55 + (0.45 * consistency)
+    return round(100.0 * (_clamp(raw) ** 2.25), 1)
 
 
 def _volume_acceleration(session_df: Optional[pd.DataFrame]) -> Tuple[float, float]:
@@ -348,6 +388,15 @@ def _range_cleanliness_penalty(session_df: Optional[pd.DataFrame], vwap_series: 
 
     total_crosses = crosses_vwap + crosses_or
     return round(_clamp(total_crosses / 6.0), 2)
+
+
+def _recent_bar_range_pct(session_df: Optional[pd.DataFrame], close: float, bars: int = 3) -> float:
+    if session_df is None or session_df.empty or close <= 0:
+        return 0.0
+    ranges = pd.Series(session_df["High"] - session_df["Low"], dtype="float64").tail(bars)
+    if ranges.empty:
+        return 0.0
+    return round((_safe_float(ranges.mean()) / max(close, 1e-6)) * 100.0, 3)
 
 
 def _rsi_zone_quality(rsi_value: float, direction: str) -> float:
@@ -445,15 +494,30 @@ def _infer_direction(
         bearish_votes += 1
         bearish_weight += 1.1
 
-    if bullish_votes >= 2 and bullish_weight > bearish_weight:
+    conflict_ratio = 0.0
+    if bullish_weight > 0 and bearish_weight > 0:
+        conflict_ratio = min(bullish_weight, bearish_weight) / max(bullish_weight, bearish_weight)
+
+    if bullish_votes >= 2 and bullish_weight > bearish_weight + 0.35:
+        if bearish_votes >= 2 and conflict_ratio >= 0.82:
+            return "NEUTRAL", 24.0
         edge = bullish_weight - bearish_weight
-        conf = round(100.0 * _clamp(0.35 + 0.18 * bullish_votes + 0.12 * edge), 1)
-        return "LONG", conf
-    if bearish_votes >= 2 and bearish_weight > bullish_weight:
+        conf = 100.0 * _clamp(0.26 + 0.15 * bullish_votes + 0.11 * edge)
+        conf *= 1.0 - 0.38 * conflict_ratio
+        if bearish_votes >= 1:
+            conf *= 0.88
+        return "LONG", round(conf, 1)
+    if bearish_votes >= 2 and bearish_weight > bullish_weight + 0.35:
+        if bullish_votes >= 2 and conflict_ratio >= 0.82:
+            return "NEUTRAL", 24.0
         edge = bearish_weight - bullish_weight
-        conf = round(100.0 * _clamp(0.35 + 0.18 * bearish_votes + 0.12 * edge), 1)
-        return "SHORT", conf
-    conf = round(100.0 * _clamp(abs(bullish_weight - bearish_weight) * 0.15), 1)
+        conf = 100.0 * _clamp(0.26 + 0.15 * bearish_votes + 0.11 * edge)
+        conf *= 1.0 - 0.38 * conflict_ratio
+        if bullish_votes >= 1:
+            conf *= 0.88
+        return "SHORT", round(conf, 1)
+
+    conf = round(100.0 * _clamp(abs(bullish_weight - bearish_weight) * 0.12), 1)
     return "NEUTRAL", conf
 
 
@@ -500,23 +564,164 @@ def _trigger_breakout_quality(
     return round(min(best_quality, 100.0), 1), best_name, best_dist
 
 
-def _vwap_acceptance_score(close_series: pd.Series, vwap_series: pd.Series, direction: str, atr_pct: float) -> float:
-    if close_series.empty or vwap_series.empty or direction == "NEUTRAL":
+def _vwap_acceptance_score(session_df: Optional[pd.DataFrame], vwap_series: pd.Series, direction: str, atr_pct: float) -> float:
+    if session_df is None or session_df.empty or vwap_series.empty or direction == "NEUTRAL":
         return 0.0
-    closes = pd.Series(close_series, dtype="float64").tail(3)
+    recent = session_df.tail(min(5, len(session_df))).copy()
+    closes = pd.Series(recent["Close"], dtype="float64")
+    highs = pd.Series(recent["High"], dtype="float64")
+    lows = pd.Series(recent["Low"], dtype="float64")
     vwaps = pd.Series(vwap_series, dtype="float64").reindex(closes.index).ffill()
     if vwaps.isna().all():
         return 0.0
-    aligned = 0
-    for close, vwap in zip(closes, vwaps):
-        if direction == "LONG" and close >= vwap:
-            aligned += 1
-        elif direction == "SHORT" and close <= vwap:
-            aligned += 1
-    acceptance = 100.0 * (aligned / max(len(closes), 1))
+    buffer_pct = max(0.05, min(0.22, atr_pct * 0.18)) / 100.0
+
+    if direction == "LONG":
+        close_hold = closes >= (vwaps * (1.0 - buffer_pct))
+        wick_hold = lows >= (vwaps * (1.0 - buffer_pct * 1.4))
+        side_relation = np.sign(closes - vwaps)
+    else:
+        close_hold = closes <= (vwaps * (1.0 + buffer_pct))
+        wick_hold = highs <= (vwaps * (1.0 + buffer_pct * 1.4))
+        side_relation = np.sign(vwaps - closes)
+
+    aligned_ratio = float(close_hold.mean()) if len(close_hold) else 0.0
+    wick_ratio = float(wick_hold.mean()) if len(wick_hold) else 0.0
+    flips = int((pd.Series(side_relation, dtype="float64").diff().abs() == 2).sum())
+    consecutive_holds = 0
+    for value in reversed(close_hold.tolist()):
+        if value:
+            consecutive_holds += 1
+        else:
+            break
+
+    hold_strength = consecutive_holds / max(len(close_hold), 1)
+    acceptance = (
+        aligned_ratio * 34.0
+        + wick_ratio * 26.0
+        + hold_strength * 28.0
+        + max(0.0, 1.0 - (flips / 3.0)) * 12.0
+    )
+
+    if aligned_ratio < 0.60 or not bool(close_hold.iloc[-1]):
+        acceptance *= 0.45
+
     dist_pct = abs((_safe_float(closes.iloc[-1]) - _safe_float(vwaps.iloc[-1])) / max(_safe_float(vwaps.iloc[-1]), 1e-6) * 100.0)
-    stretch_penalty = 25.0 * _clamp((dist_pct - max(atr_pct * 0.9, 0.25)) / max(atr_pct * 1.2, 0.35))
+    stretch_penalty = 18.0 * _clamp((dist_pct - max(atr_pct * 0.95, 0.28)) / max(atr_pct * 1.1, 0.40))
     return round(max(0.0, acceptance - stretch_penalty), 1)
+
+
+def _reversal_quality(
+    session_df: Optional[pd.DataFrame],
+    vwap_series: pd.Series,
+    direction: str,
+    live_change: float,
+    rsi_slope: float,
+    price_slope: float,
+    candle_quality: float,
+    atr_pct: float,
+) -> float:
+    if session_df is None or len(session_df) < 4 or vwap_series.empty or direction == "NEUTRAL":
+        return 0.0
+
+    recent = session_df.tail(min(5, len(session_df))).copy()
+    closes = pd.Series(recent["Close"], dtype="float64")
+    highs = pd.Series(recent["High"], dtype="float64")
+    lows = pd.Series(recent["Low"], dtype="float64")
+    vwaps = pd.Series(vwap_series, dtype="float64").reindex(closes.index).ffill()
+    if vwaps.isna().all():
+        return 0.0
+
+    buffer_pct = max(0.05, min(0.24, atr_pct * 0.20)) / 100.0
+    or_high, or_low = _opening_range_levels(session_df)
+    close = _safe_float(closes.iloc[-1])
+    vwap = _safe_float(vwaps.iloc[-1])
+
+    if direction == "LONG":
+        hold_ratio = float((closes >= (vwaps * (1.0 - buffer_pct))).mean())
+        wick_ratio = float((lows >= (vwaps * (1.0 - buffer_pct * 1.4))).mean())
+        reclaim_key = 1.0 if or_high > 0 and close >= or_high else 0.55 if close >= vwap else 0.0
+        slope_score = (
+            _positive_score(rsi_slope, 0.018) * 0.55
+            + _positive_score(price_slope, 0.0022) * 0.45
+        ) / 100.0
+        adverse_move = _clamp((-live_change - 0.8) / 2.4) if live_change < -0.8 else 0.0
+    else:
+        hold_ratio = float((closes <= (vwaps * (1.0 + buffer_pct))).mean())
+        wick_ratio = float((highs <= (vwaps * (1.0 + buffer_pct * 1.4))).mean())
+        reclaim_key = 1.0 if or_low > 0 and close <= or_low else 0.55 if close <= vwap else 0.0
+        slope_score = (
+            _positive_score(-rsi_slope, 0.018) * 0.55
+            + _positive_score(-price_slope, 0.0022) * 0.45
+        ) / 100.0
+        adverse_move = _clamp((live_change - 0.8) / 2.4) if live_change > 0.8 else 0.0
+
+    raw = (
+        hold_ratio * 0.38
+        + wick_ratio * 0.22
+        + reclaim_key * 0.20
+        + slope_score * 0.12
+        + (_clamp(candle_quality / 100.0)) * 0.08
+    )
+    raw *= 1.0 - adverse_move * 0.10
+    return round(100.0 * _clamp(raw), 1)
+
+
+def _adjust_direction_confidence(
+    direction: str,
+    base_conf: float,
+    live_change: float,
+    rsi_value: float,
+    vwap_acceptance: float,
+    reversal_quality: float,
+    breakout_quality: float,
+) -> float:
+    if direction == "NEUTRAL":
+        return round(_clamp(base_conf / 100.0) * 100.0, 1)
+
+    conflict = 0.0
+    support = 0.0
+    if direction == "LONG":
+        if live_change < -0.8:
+            conflict += _clamp((-live_change - 0.8) / 2.5)
+        if rsi_value < 48:
+            conflict += _clamp((48.0 - rsi_value) / 18.0)
+        if vwap_acceptance < 45:
+            conflict += 0.8 * _clamp((45.0 - vwap_acceptance) / 45.0)
+        support = 0.55 * (reversal_quality / 100.0) + 0.45 * (breakout_quality / 100.0)
+    else:
+        if live_change > 0.8:
+            conflict += _clamp((live_change - 0.8) / 2.5)
+        if rsi_value > 52:
+            conflict += _clamp((rsi_value - 52.0) / 18.0)
+        if vwap_acceptance < 45:
+            conflict += 0.8 * _clamp((45.0 - vwap_acceptance) / 45.0)
+        support = 0.55 * (reversal_quality / 100.0) + 0.45 * (breakout_quality / 100.0)
+
+    conflict = _clamp(conflict / 2.4)
+    adjusted = base_conf * (1.0 - 0.62 * conflict * (1.0 - 0.80 * support))
+
+    if direction == "LONG" and live_change < -1.2:
+        adjusted = min(adjusted, 34.0 + (reversal_quality * 0.58))
+    elif direction == "SHORT" and live_change > 1.2:
+        adjusted = min(adjusted, 34.0 + (reversal_quality * 0.58))
+
+    if conflict >= 0.85 and support < 0.45:
+        adjusted = min(adjusted, 34.0)
+
+    return round(max(0.0, min(adjusted, 100.0)), 1)
+
+
+def _freshness_score(dist_pct: float, atr_pct: float, recent_bar_pct: float) -> float:
+    excursion = abs(dist_pct)
+    if excursion <= 0:
+        return 100.0
+    freshness_band = max(0.22, atr_pct * 0.70 + recent_bar_pct * 0.45)
+    if excursion <= freshness_band:
+        return 100.0
+    excess_ratio = (excursion - freshness_band) / max(freshness_band, 0.12)
+    freshness = 100.0 * math.exp(-1.35 * excess_ratio)
+    return round(max(0.0, min(freshness, 100.0)), 1)
 
 
 def _stage_weights(stage: str) -> Tuple[float, float]:
@@ -533,8 +738,10 @@ def _stage_weights(stage: str) -> Tuple[float, float]:
     return 0.55, 0.45
 
 
-def _determine_stage(pre_score: float, trigger_score: float, breakout_quality: float, is_chase: bool) -> str:
+def _determine_stage(pre_score: float, trigger_score: float, breakout_quality: float, is_chase: bool, freshness_score: float) -> str:
     if is_chase and trigger_score >= 55:
+        return "EXTENDED"
+    if freshness_score < 42 and trigger_score >= 50:
         return "EXTENDED"
     if trigger_score >= 75 and breakout_quality >= 65:
         return "CONFIRMED"
@@ -547,16 +754,33 @@ def _determine_stage(pre_score: float, trigger_score: float, breakout_quality: f
     return "NEUTRAL"
 
 
-def _opportunity_score(pre_score: float, trigger_score: float, direction_conf: float, chop_penalty: float, is_chase: bool) -> float:
+def _opportunity_score(
+    pre_score: float,
+    trigger_score: float,
+    direction_conf: float,
+    chop_penalty: float,
+    is_chase: bool,
+    freshness_score: float,
+) -> float:
     raw = (
-        pre_score * 0.40
-        + trigger_score * 0.30
-        + direction_conf * 0.20
-        + (100.0 * (1.0 - chop_penalty)) * 0.10
+        pre_score * 0.38
+        + trigger_score * 0.28
+        + direction_conf * 0.18
+        + freshness_score * 0.10
+        + (100.0 * (1.0 - chop_penalty)) * 0.06
     )
     if is_chase:
-        raw *= 0.62
+        raw *= 0.58
     return round(_clamp(raw / 100.0) * 100.0, 1)
+
+
+def _apply_legacy_aliases(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload["prescore"] = payload.get("pre_score", 0.0)
+    payload["triggerscore"] = payload.get("trigger_score", 0.0)
+    payload["ischase"] = payload.get("is_chase", False)
+    payload["chasereason"] = payload.get("chase_reason", "")
+    payload["alertstage"] = payload.get("alert_stage", "NEUTRAL")
+    return payload
 
 
 def _change_pct_from_prev_close(close: float, prev_close: float, fallback: float) -> float:
@@ -600,6 +824,10 @@ def _evaluate_symbol(
     if session_date is not None:
         _, _, prev_day_close = _prev_day_levels(df_5m, session_date)
 
+    live_change = live_change_pct if live_change_pct is not None else _safe_float(stock.get("change_pct"), 0.0)
+    live_change = _change_pct_from_prev_close(close, prev_day_close, live_change)
+    relative_strength = round(live_change - nifty_avg, 2)
+
     close_series = pd.Series(dtype="float64") if session_df is None else pd.Series(session_df["Close"], dtype="float64").dropna()
     rsi_series = _calculate_rsi_series(close_series)
     rsi_value = round(_safe_float(rsi_series.iloc[-1], 50.0), 1) if not rsi_series.empty else 50.0
@@ -631,6 +859,7 @@ def _evaluate_symbol(
     vol_accel_ratio, vol_accel_score = _volume_acceleration(session_df)
     chop_penalty = _range_cleanliness_penalty(session_df, vwap_series)
     one_min_boost = _one_min_confirmation(df_1m, inferred_direction)
+    recent_bar_pct = _recent_bar_range_pct(session_df, close)
 
     if inferred_direction == "LONG":
         obv_slope_score = _positive_score(obv_slope_raw, 0.03)
@@ -651,8 +880,7 @@ def _evaluate_symbol(
         nearest_level = long_level_name if long_proximity >= short_proximity else short_level_name
         dist_pct = long_level_dist if long_proximity >= short_proximity else short_level_dist
 
-    direction_multiplier = 0.45 + 0.55 * _clamp(direction_conf / 100.0)
-    pre_score = (
+    structural_pre_score = (
         compression * 0.24
         + obv_slope_score * 0.16
         + rsi_lead_score * 0.24
@@ -660,13 +888,6 @@ def _evaluate_symbol(
         + proximity_score * 0.15
         + one_min_boost * 0.05
     )
-    pre_score *= direction_multiplier
-    pre_score *= 1.0 - (0.40 * chop_penalty)
-    pre_score = round(max(0.0, min(pre_score, 100.0)), 1)
-
-    live_change = live_change_pct if live_change_pct is not None else _safe_float(stock.get("change_pct"), 0.0)
-    live_change = _change_pct_from_prev_close(close, prev_day_close, live_change)
-    relative_strength = round(live_change - nifty_avg, 2)
 
     candle_quality = _candle_quality(session_df.iloc[-1] if session_df is not None and not session_df.empty else pd.Series(dtype="float64"), inferred_direction)
     breakout_quality, breakout_level_name, breakout_dist_pct = _trigger_breakout_quality(
@@ -677,9 +898,42 @@ def _evaluate_symbol(
         candle_quality=candle_quality,
         atr_pct=atr_pct,
     )
-    vwap_acceptance = _vwap_acceptance_score(close_series, vwap_series, inferred_direction, atr_pct)
+    vwap_acceptance = _vwap_acceptance_score(session_df, vwap_series, inferred_direction, atr_pct)
     volume_confirmation = round(min(100.0, vol_accel_score * 1.1), 1)
     rsi_zone = _rsi_zone_quality(rsi_value, inferred_direction)
+    reversal_quality = _reversal_quality(
+        session_df=session_df,
+        vwap_series=vwap_series,
+        direction=inferred_direction,
+        live_change=live_change,
+        rsi_slope=rsi_slope_raw,
+        price_slope=price_slope_raw,
+        candle_quality=candle_quality,
+        atr_pct=atr_pct,
+    )
+    direction_conf = _adjust_direction_confidence(
+        direction=inferred_direction,
+        base_conf=direction_conf,
+        live_change=live_change,
+        rsi_value=rsi_value,
+        vwap_acceptance=vwap_acceptance,
+        reversal_quality=reversal_quality,
+        breakout_quality=breakout_quality,
+    )
+
+    direction_multiplier = 0.42 + 0.58 * _clamp(direction_conf / 100.0)
+    pre_score = structural_pre_score * direction_multiplier
+    pre_score *= 1.0 - (0.42 * chop_penalty)
+
+    counter_trend_penalty = 0.0
+    if inferred_direction == "LONG" and live_change < -0.8:
+        counter_trend_penalty = _clamp((-live_change - 0.8) / 2.6)
+    elif inferred_direction == "SHORT" and live_change > 0.8:
+        counter_trend_penalty = _clamp((live_change - 0.8) / 2.6)
+
+    if counter_trend_penalty > 0:
+        reversal_support = _clamp(reversal_quality / 100.0)
+        pre_score *= 1.0 - (0.62 * counter_trend_penalty * (1.0 - reversal_support))
 
     trigger_score = (
         breakout_quality * 0.38
@@ -692,6 +946,17 @@ def _evaluate_symbol(
         trigger_score *= 0.85
     elif inferred_direction == "SHORT" and live_change > 0:
         trigger_score *= 0.85
+
+    if counter_trend_penalty > 0:
+        reversal_support = _clamp(reversal_quality / 100.0)
+        trigger_score *= 1.0 - (0.68 * counter_trend_penalty * (1.0 - reversal_support))
+
+    freshness_score = 100.0
+    if breakout_level_name:
+        freshness_score = _freshness_score(breakout_dist_pct, atr_pct, recent_bar_pct)
+        trigger_score *= 0.42 + 0.58 * (freshness_score / 100.0)
+
+    pre_score = round(max(0.0, min(pre_score, 100.0)), 1)
     trigger_score = round(max(0.0, min(trigger_score, 100.0)), 1)
 
     chase_flags: List[str] = []
@@ -707,6 +972,8 @@ def _evaluate_symbol(
             chase_flags.append("above_breakout_band")
         if inferred_direction == "SHORT" and abs(breakout_dist_pct) > max(0.45, atr_pct * 0.9):
             chase_flags.append("below_breakout_band")
+        if freshness_score < 45:
+            chase_flags.append("stale_breakout")
     if session_df is not None and len(session_df) >= 4 and atr_value > 0:
         move_3 = abs(_safe_float(session_df["Close"].iloc[-1]) - _safe_float(session_df["Close"].iloc[-4]))
         if move_3 > atr_value * 1.8:
@@ -715,14 +982,21 @@ def _evaluate_symbol(
     is_chase = len(set(chase_flags)) >= 2
     chase_reason = ", ".join(sorted(set(chase_flags))) if is_chase else ""
 
-    setup_stage = _determine_stage(pre_score, trigger_score, breakout_quality, is_chase)
+    setup_stage = _determine_stage(pre_score, trigger_score, breakout_quality, is_chase, freshness_score)
     alert_stage = setup_stage
     pre_weight, trigger_weight = _stage_weights(setup_stage)
     rfactor_raw = pre_score * pre_weight + trigger_score * trigger_weight
     if is_chase:
         rfactor_raw *= 0.84
     rfactor = round(_clamp(rfactor_raw / 100.0) * 5.0, 2)
-    opportunity_score = _opportunity_score(pre_score, trigger_score, direction_conf, chop_penalty, is_chase)
+    opportunity_score = _opportunity_score(
+        pre_score,
+        trigger_score,
+        direction_conf,
+        chop_penalty,
+        is_chase,
+        freshness_score,
+    )
 
     selected_level = breakout_level_name or nearest_level
     selected_dist_pct = breakout_dist_pct if breakout_level_name else dist_pct
@@ -737,7 +1011,7 @@ def _evaluate_symbol(
     delivery_pct = _safe_float(nse_quote.get("delivery_pct"))
     bid_ask_ratio = _safe_float(nse_quote.get("bid_ask_ratio"))
 
-    return {
+    return _apply_legacy_aliases({
         "rfactor": rfactor,
         "tier": get_rfactor_color_tier(rfactor),
         "rsi": rsi_value,
@@ -771,7 +1045,7 @@ def _evaluate_symbol(
         "day_low": day_low,
         "vwap": vwap,
         "change_pct": live_change,
-    }
+    })
 
 
 def _trend_snapshots(
@@ -879,12 +1153,21 @@ def calculate_rfactor_for_all(
             stock["rfactor_trend_acceleration"] = trend_accel
 
             chop_penalty = _range_cleanliness_penalty(_session_df(df_5m), _intraday_vwap(_session_df(df_5m))) if df_5m is not None else 0.0
+            freshness_score = 100.0
+            if stock.get("nearest_level") and _safe_float(stock.get("dist_pct")) != 999.0:
+                freshness_score = _freshness_score(
+                    _safe_float(stock.get("dist_pct")),
+                    (_safe_float(stock.get("day_high")) - _safe_float(stock.get("day_low"))) / max(_safe_float(stock.get("ltp"), 1.0), 1e-6) * 100.0,
+                    0.0,
+                )
+
             stock["opportunity_score"] = _opportunity_score(
                 pre_score=_safe_float(stock.get("pre_score")),
                 trigger_score=_safe_float(stock.get("trigger_score")),
                 direction_conf=_safe_float(stock.get("direction_conf")),
                 chop_penalty=chop_penalty,
                 is_chase=bool(stock.get("is_chase")),
+                freshness_score=freshness_score,
             )
 
             if len(trend_points) >= 2 and not stock.get("is_chase"):
@@ -895,8 +1178,10 @@ def calculate_rfactor_for_all(
                     stock["setup_stage"] = "BREAKING"
                     stock["alert_stage"] = "BREAKING"
 
+            _apply_legacy_aliases(stock)
+
         except Exception as exc:
-            logger.warning("R-Factor v3 failed for %s: %s", clean_sym, exc)
+            logger.warning("R-Factor v4 failed for %s: %s", clean_sym, exc)
             stock.setdefault("rfactor", 0.0)
             stock.setdefault("tier", "very_weak")
             stock.setdefault("rsi", 50.0)
@@ -924,6 +1209,7 @@ def calculate_rfactor_for_all(
             stock.setdefault("vwap_acceptance", 0.0)
             stock.setdefault("is_chase", False)
             stock.setdefault("chase_reason", "")
+            _apply_legacy_aliases(stock)
 
     return sym_data
 
@@ -984,6 +1270,7 @@ def get_dashboard_rows(sym_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "is_chase": stock.get("is_chase", False),
             "chase_reason": stock.get("chase_reason", ""),
         })
+        _apply_legacy_aliases(rows[-1])
 
     rows.sort(
         key=lambda item: (
