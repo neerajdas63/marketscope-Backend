@@ -2,6 +2,8 @@
 
 import logging
 import threading
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Any, Dict, Optional

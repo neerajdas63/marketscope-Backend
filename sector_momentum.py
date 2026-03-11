@@ -1,5 +1,7 @@
-# sector_momentum.py — Momentum Acceleration tracker (9:15–10:00 AM, every 5 min)
+"""sector_momentum.py — Momentum Acceleration tracker (9:15–10:00 AM, every 5 min)"""
 
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import logging
 from datetime import datetime
 from statistics import mean
@@ -123,6 +125,8 @@ def backfill_today_snapshots() -> None:
     time slots so the Opening tracker shows the full picture, not just "--".
     """
     from stocks import SECTORS
+    import os
+    os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
     import pandas as pd
 
@@ -159,20 +163,32 @@ def backfill_today_snapshots() -> None:
     tickers_str = " ".join(sampled_symbols)
 
     # ── Daily data for prev_close ─────────────────────────────────────────────
-    try:
-        daily_raw = yf.download(
-            tickers=tickers_str,
-            period="5d",
-            interval="1d",
-            auto_adjust=False,
-            group_by="ticker",
-            progress=False,
-            threads=True,
-            timeout=30,
-        )
-    except Exception as exc:
-        logger.warning("Backfill: daily download failed: %s", exc)
-        return
+    import time as _time
+    import pandas as pd
+    # Batch daily download
+    daily_batches = []
+    for i in range(0, len(sampled_symbols), 30):
+        batch = sampled_symbols[i:i+30]
+        try:
+            df = yf.download(
+                tickers=" ".join(batch),
+                period="5d",
+                interval="1d",
+                auto_adjust=False,
+                group_by="ticker",
+                progress=False,
+                threads=True,
+                timeout=30,
+            )
+            if df is not None and not df.empty:
+                daily_batches.append(df)
+        except Exception as exc:
+            logger.warning(f"Backfill: daily batch failed: {exc}")
+        _time.sleep(2)
+    if daily_batches:
+        daily_raw = pd.concat(daily_batches, axis=1)
+    else:
+        daily_raw = None
 
     def get_prev_close(symbol: str) -> float:
         try:
@@ -187,20 +203,30 @@ def backfill_today_snapshots() -> None:
             return 0.0
 
     # ── Intraday data for today ───────────────────────────────────────────────
-    try:
-        intra_raw = yf.download(
-            tickers=tickers_str,
-            period="1d",
-            interval="5m",
-            auto_adjust=False,
-            group_by="ticker",
-            progress=False,
-            threads=True,
-            timeout=30,
-        )
-    except Exception as exc:
-        logger.warning("Backfill: intraday download failed: %s", exc)
-        return
+    # Batch intraday download
+    intra_batches = []
+    for i in range(0, len(sampled_symbols), 30):
+        batch = sampled_symbols[i:i+30]
+        try:
+            df = yf.download(
+                tickers=" ".join(batch),
+                period="1d",
+                interval="5m",
+                auto_adjust=False,
+                group_by="ticker",
+                progress=False,
+                threads=True,
+                timeout=30,
+            )
+            if df is not None and not df.empty:
+                intra_batches.append(df)
+        except Exception as exc:
+            logger.warning(f"Backfill: intraday batch failed: {exc}")
+        _time.sleep(2)
+    if intra_batches:
+        intra_raw = pd.concat(intra_batches, axis=1)
+    else:
+        intra_raw = None
 
     if intra_raw is None or intra_raw.empty:
         logger.warning("Backfill: empty intraday data")

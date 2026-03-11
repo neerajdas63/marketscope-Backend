@@ -303,6 +303,10 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
     Compute 52-week high breakout candidates for all F&O stocks.
     Uses batch yfinance download (1-year daily). Expensive — called in background only.
     """
+    import os
+    os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
+    import os
+    os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
     import numpy as np
     from stocks import FO_STOCKS
@@ -310,21 +314,31 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
     symbols_ns = [sym + ".NS" for sym in FO_STOCKS]
     logger.info("52W scanner: downloading 1-year daily data for %d symbols…", len(symbols_ns))
 
-    try:
-        raw = yf.download(
-            tickers=" ".join(symbols_ns),
-            period="1y",
-            interval="1d",
-            auto_adjust=False,
-            group_by="ticker",
-            progress=False,
-            threads=True,
-            timeout=60,
-        )
-    except Exception as exc:
-        logger.error("52W download failed: %s", exc)
+    import time as _time
+    import pandas as pd
+    results = []
+    for i in range(0, len(symbols_ns), 30):
+        batch = symbols_ns[i:i+30]
+        try:
+            raw = yf.download(
+                tickers=" ".join(batch),
+                period="1y",
+                interval="1d",
+                auto_adjust=False,
+                group_by="ticker",
+                progress=False,
+                threads=True,
+                timeout=60,
+            )
+            if raw is not None and not raw.empty:
+                results.append(raw)
+        except Exception as exc:
+            logger.error(f"52W batch download failed for {batch}: {exc}")
+        _time.sleep(2)
+    if results:
+        raw = pd.concat(results, axis=1)
+    else:
         return []
-
     if raw is None or raw.empty:
         return []
 

@@ -1,5 +1,7 @@
 # main.py — MarketScope FastAPI application entry point
 
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -175,6 +177,9 @@ async def lifespan(app: FastAPI):
         id="sector_momentum_snapshot",
         name="Sector momentum snapshot at slot times",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     logger.info("Sector momentum snapshot job registered (cron-aligned).")
 

@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import pytz
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import yfinance as yf
 
 from nse_fetcher import fetch_nse_index_quotes
@@ -78,24 +82,30 @@ def _chunked(items: Sequence[Any], size: int) -> List[List[Any]]:
 def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame]:
     if not symbols_ns:
         return None
-    try:
-        raw = yf.download(
-            tickers=" ".join(symbols_ns),
-            period="35d",
-            interval="5m",
-            auto_adjust=False,
-            group_by="ticker",
-            progress=False,
-            threads=False,
-            timeout=20,
-        )
-        if raw is None or raw.empty:
-            logger.warning("Momentum Pulse batch download returned empty for %d symbols.", len(symbols_ns))
-            return None
-        return raw
-    except Exception as exc:
-        logger.warning("Momentum Pulse batch download failed for %d symbols: %s", len(symbols_ns), exc)
-        return None
+    import time as _time
+    import pandas as pd
+    results = []
+    for i in range(0, len(symbols_ns), 30):
+        batch = symbols_ns[i:i+30]
+        try:
+            raw = yf.download(
+                tickers=" ".join(batch),
+                period="35d",
+                interval="5m",
+                auto_adjust=False,
+                group_by="ticker",
+                progress=False,
+                threads=False,
+                timeout=20,
+            )
+            if raw is not None and not raw.empty:
+                results.append(raw)
+        except Exception as exc:
+            logger.warning(f"Momentum Pulse batch download failed for {batch}: {exc}")
+        _time.sleep(2)
+    if results:
+        return pd.concat(results, axis=1)
+    return None
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:

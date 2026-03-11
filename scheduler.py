@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -110,6 +112,7 @@ def start_scheduler(cache_obj: "InMemoryCache") -> AsyncIOScheduler:
         replace_existing=True,
         max_instances=1,      # never run two fetches simultaneously
         coalesce=True,        # if missed intervals, run once not multiple times
+        misfire_grace_time=60, # allow 60s grace for slow jobs
     )
     scheduler.start()
     logger.info("Scheduler started — market data will refresh every 5 minutes.")

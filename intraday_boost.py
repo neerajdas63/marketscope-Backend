@@ -8,8 +8,11 @@ from typing import Any, Dict
 logger = logging.getLogger("intraday_boost")
 
 
+
 def _get_sym_df(data, symbol: str):
     """Extract a single-symbol DataFrame from a flat or MultiIndex yfinance result."""
+    import os
+    os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     try:
         if data is None:
             return None

@@ -2,6 +2,8 @@
 
 import logging
 import threading
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime

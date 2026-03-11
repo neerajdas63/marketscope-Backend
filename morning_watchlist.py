@@ -53,6 +53,8 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
     top-3 sectors.
     """
     import pandas as pd
+    import os
+    os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
     from stocks import SECTORS
 

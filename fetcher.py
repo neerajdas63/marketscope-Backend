@@ -8,6 +8,11 @@ from typing import Any, Dict, List
 
 import pandas as pd
 import pytz
+
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
+import os
+os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import yfinance as yf
 
 from angel_client import get_bulk_ltp, get_bulk_full_quotes
@@ -288,9 +293,31 @@ def fetch_all_sectors() -> Dict[str, Any]:
         logger.warning(f"NSE index quote fetch failed: {e}")
 
     # STEP 2 — Daily yfinance: 20-day volume average baseline (fast; 1d interval, 5d period)
+
+    # Batch yfinance downloads in groups of 30, with 2s sleep and try/except
+    def batch_download(symbols, **kwargs):
+        import time
+        import pandas as pd
+        results = []
+        for i in range(0, len(symbols), 30):
+            batch = symbols[i:i+30]
+            try:
+                df = yf.download(
+                    tickers=" ".join(batch),
+                    **kwargs
+                )
+                if df is not None and not df.empty:
+                    results.append(df)
+            except Exception as exc:
+                logger.warning(f"yfinance batch download failed for {batch}: {exc}")
+            time.sleep(2)
+        if results:
+            return pd.concat(results, axis=1)
+        return None
+
     logger.info(f"Downloading daily data for volume baseline ({len(ALL_SYMBOLS)} symbols)...")
-    daily_data = yf.download(
-        tickers=all_syms_str,
+    daily_data = batch_download(
+        ALL_SYMBOLS,
         period="5d",
         interval="1d",
         auto_adjust=False,
@@ -300,10 +327,9 @@ def fetch_all_sectors() -> Dict[str, Any]:
         timeout=30,
     )
 
-    # STEP 3 — 15-min yfinance: RSI / MFI candle series (no free NSE equivalent)
     logger.info(f"Downloading 15-min data for RSI/MFI ({len(ALL_SYMBOLS)} symbols)...")
-    data_15min = yf.download(
-        tickers=all_syms_str,
+    data_15min = batch_download(
+        ALL_SYMBOLS,
         period="5d",
         interval="15m",
         auto_adjust=False,
