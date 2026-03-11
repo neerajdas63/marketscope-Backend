@@ -11,8 +11,6 @@ import pytz
 
 import os
 os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
-import os
-os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import yfinance as yf
 
 from angel_client import get_bulk_ltp, get_bulk_full_quotes

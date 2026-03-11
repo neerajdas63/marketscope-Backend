@@ -183,8 +183,8 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Sector momentum snapshot job registered (cron-aligned).")
 
-    # Block startup until the first cache warm-up completes.
-    await _bg_init_fetch()
+    # Start initial fetch in the background (non-blocking)
+    asyncio.create_task(_bg_init_fetch())
 
     # Catch-up backfill also runs in the background if started after market open.
     if _is_after_open_today():
@@ -241,19 +241,10 @@ async def get_heatmap() -> Dict[str, Any]:
       a fresh fetch is triggered synchronously before responding.
     - If no data is available yet, returns an error with a retry hint.
     """
-    # Refresh stale cache during market hours
-    if cache.is_stale(CACHE_DURATION_SECONDS) and is_market_hours():
-        logger.info("/heatmap: cache stale during market hours — fetching fresh data.")
-        try:
-            fresh_data = fetch_all_sectors()
-            cache.set(fresh_data)
-        except Exception as exc:
-            logger.error(f"/heatmap: on-demand fetch failed: {exc}", exc_info=True)
-
+    # If cache is empty or stale, return a warming up/loading response
     data = cache.get()
-
-    if data is None:
-        return {"error": "Data not available yet", "retry_after": 10}
+    if data is None or cache.is_stale(CACHE_DURATION_SECONDS):
+        return _warming_up_response(stocks=[], sectors=[], last_updated="", total=0)
 
     # Ensure market_open reflects the current moment
     response = dict(data)
@@ -279,7 +270,7 @@ async def get_rfactor(
     - sort_by: rfactor | opportunity | trend
     """
     cached = cache.get()
-    if not cached:
+    if not cached or cache.is_stale(CACHE_DURATION_SECONDS):
         return _warming_up_response(stocks=[], last_updated="", total=0)
 
     # Use the scanner_stocks universe (not heatmap sectors)
