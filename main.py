@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from cache import InMemoryCache
-from backend.momentum_pulse import get_momentum_pulse
+from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
 from fetcher import fetch_all_sectors
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -107,6 +107,11 @@ async def _bg_init_fetch() -> None:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mscope-init") as ex:
                 initial_data = await loop.run_in_executor(ex, fetch_all_sectors)
             cache.set(initial_data)
+            schedule_momentum_pulse_refresh(
+                scanner_stocks=list(initial_data.get("scanner_stocks", [])),
+                last_updated=str(initial_data.get("last_updated", "") or ""),
+                force=True,
+            )
             logger.info("[INIT] Initial fetch completed successfully.")
             break
         except Exception as exc:

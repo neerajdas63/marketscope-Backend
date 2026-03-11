@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from backend.momentum_pulse import schedule_momentum_pulse_refresh
 from fetcher import fetch_all_sectors
 
 # Dedicated thread-pool so fetches never block the async event loop
@@ -60,6 +61,11 @@ async def scheduled_fetch(cache_obj: "InMemoryCache") -> None:
         # coroutine is cancelled by APScheduler before the fetch finishes.
         data = await asyncio.shield(loop.run_in_executor(_fetch_executor, fetch_all_sectors))
         cache_obj.set(data)
+        schedule_momentum_pulse_refresh(
+            scanner_stocks=list(data.get("scanner_stocks", [])),
+            last_updated=str(data.get("last_updated", "") or ""),
+            force=True,
+        )
         now_ist = datetime.now(IST).strftime("%H:%M:%S")
         logger.info(f"Scheduled fetch completed successfully at {now_ist} IST.")
 
