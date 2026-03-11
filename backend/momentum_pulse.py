@@ -349,7 +349,8 @@ def calculate_vwap_alignment(
 
 def _score_series_metrics(scores: Sequence[float]) -> Dict[str, Any]:
     score_history = [round(_safe_float(value), 1) for value in scores][-MAX_HISTORY_POINTS:]
-    if not score_history:
+    n = len(score_history)
+    if n == 0:
         return {
             "score_history": [],
             "score_change_5m": 0.0,
@@ -364,11 +365,14 @@ def _score_series_metrics(scores: Sequence[float]) -> Dict[str, Any]:
         }
 
     def _change(steps: int) -> float:
-        if len(score_history) <= steps:
+        if n <= steps:
+            # Fallback: use whatever is available
+            if n >= 2:
+                return round(score_history[-1] - score_history[0], 1)
             return 0.0
         return round(score_history[-1] - score_history[-(steps + 1)], 1)
 
-    diffs = [round(score_history[index] - score_history[index - 1], 1) for index in range(1, len(score_history))]
+    diffs = [round(score_history[index] - score_history[index - 1], 1) for index in range(1, n)]
     improving_streak = 0
     for diff in reversed(diffs):
         if diff > 0:
@@ -382,10 +386,13 @@ def _score_series_metrics(scores: Sequence[float]) -> Dict[str, Any]:
             continue
         break
 
+    # Slope: fallback to 2-point slope if <3 points
     score_slope = 0.0
-    if len(score_history) >= 3:
-        x_axis = np.arange(len(score_history), dtype="float64")
+    if n >= 3:
+        x_axis = np.arange(n, dtype="float64")
         score_slope = round(float(np.polyfit(x_axis, np.array(score_history, dtype="float64"), 1)[0]), 2)
+    elif n == 2:
+        score_slope = round(score_history[1] - score_history[0], 2)
 
     score_acceleration = 0.0
     if len(diffs) >= 2:
@@ -395,6 +402,7 @@ def _score_series_metrics(scores: Sequence[float]) -> Dict[str, Any]:
     score_change_10m = _change(2)
     score_change_15m = _change(3)
 
+    # Trend label: fallback to available metrics
     if score_change_10m >= 2.0 or score_slope >= 1.0 or improving_streak >= 2:
         pulse_trend_label = "Rising"
     elif score_change_10m <= -2.0 or score_slope <= -1.0 or weakening_streak >= 2:
