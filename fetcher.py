@@ -2,6 +2,7 @@
 
 import time
 import logging
+import threading
 from statistics import mean
 from datetime import datetime, time as dt_time
 from typing import Any, Dict, List
@@ -20,6 +21,17 @@ from intraday_boost import calculate_intraday_boost
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
+DAILY_BASELINE_REFRESH_SECONDS = int(os.getenv("DAILY_BASELINE_REFRESH_SECONDS", "21600"))
+
+_daily_baseline_lock = threading.Lock()
+_daily_baseline_cache: Dict[str, Any] = {
+    "trading_date": "",
+    "fetched_at": 0.0,
+    "prev_close_by_symbol": {},
+    "avg_volume_by_symbol": {},
+    "is_loading": False,
+    "last_attempt": 0.0,
+}
 
 
 def _get_sector_index_change_pct(
@@ -50,6 +62,129 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _get_sym_df(data: Any, symbol: str):
+    """Extract a single symbol dataframe from a flat or MultiIndex yfinance response."""
+    try:
+        if data is None:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            if symbol in data.columns.get_level_values(0):
+                df = data[symbol]
+                return df if not df.empty else None
+            return None
+        return data if not data.empty else None
+    except Exception:
+        return None
+
+
+def _batch_download(symbols: List[str], **kwargs):
+    results = []
+    for index in range(0, len(symbols), 30):
+        batch = symbols[index:index + 30]
+        try:
+            df = yf.download(tickers=" ".join(batch), **kwargs)
+            if df is not None and not df.empty:
+                results.append(df)
+        except Exception as exc:
+            logger.warning("yfinance batch download failed for %s: %s", batch, exc)
+        time.sleep(1)
+    if results:
+        return pd.concat(results, axis=1)
+    return None
+
+
+def _snapshot_daily_baseline() -> Dict[str, Any]:
+    with _daily_baseline_lock:
+        return {
+            "trading_date": str(_daily_baseline_cache.get("trading_date") or ""),
+            "fetched_at": _safe_float(_daily_baseline_cache.get("fetched_at")),
+            "prev_close_by_symbol": dict(_daily_baseline_cache.get("prev_close_by_symbol") or {}),
+            "avg_volume_by_symbol": dict(_daily_baseline_cache.get("avg_volume_by_symbol") or {}),
+            "is_loading": bool(_daily_baseline_cache.get("is_loading")),
+            "last_attempt": _safe_float(_daily_baseline_cache.get("last_attempt")),
+        }
+
+
+def _daily_baseline_is_stale(snapshot: Dict[str, Any]) -> bool:
+    today_key = datetime.now(IST).date().isoformat()
+    if str(snapshot.get("trading_date") or "") != today_key:
+        return True
+    fetched_at = _safe_float(snapshot.get("fetched_at"))
+    if fetched_at <= 0:
+        return True
+    return (time.time() - fetched_at) >= DAILY_BASELINE_REFRESH_SECONDS
+
+
+def _refresh_daily_baseline_cache(symbols: List[str]) -> None:
+    try:
+        logger.info("Refreshing daily baseline cache for %d symbols...", len(symbols))
+        daily_data = _batch_download(
+            symbols,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            group_by="ticker",
+            progress=False,
+            threads=True,
+            timeout=20,
+        )
+        prev_close_by_symbol: Dict[str, float] = {}
+        avg_volume_by_symbol: Dict[str, float] = {}
+        for symbol in symbols:
+            df = _get_sym_df(daily_data, symbol)
+            if df is None:
+                continue
+            close_series = df.get("Close")
+            volume_series = df.get("Volume")
+            if close_series is not None:
+                close_values = close_series.dropna()
+                if len(close_values) >= 2:
+                    prev_close_by_symbol[symbol.replace(".NS", "")] = _safe_float(close_values.iloc[-2])
+            if volume_series is not None:
+                volume_values = volume_series.dropna()
+                if len(volume_values) >= 3:
+                    avg_volume_by_symbol[symbol.replace(".NS", "")] = float(volume_values.tail(20).mean())
+
+        with _daily_baseline_lock:
+            _daily_baseline_cache["trading_date"] = datetime.now(IST).date().isoformat()
+            _daily_baseline_cache["fetched_at"] = time.time()
+            _daily_baseline_cache["prev_close_by_symbol"] = prev_close_by_symbol
+            _daily_baseline_cache["avg_volume_by_symbol"] = avg_volume_by_symbol
+        logger.info(
+            "Daily baseline cache refreshed: %d prev closes, %d avg-volume entries.",
+            len(prev_close_by_symbol),
+            len(avg_volume_by_symbol),
+        )
+    except Exception as exc:
+        logger.warning("Daily baseline cache refresh failed: %s", exc)
+    finally:
+        with _daily_baseline_lock:
+            _daily_baseline_cache["is_loading"] = False
+
+
+def _ensure_daily_baseline_cache(symbols: List[str]) -> Dict[str, Any]:
+    snapshot = _snapshot_daily_baseline()
+    if not _daily_baseline_is_stale(snapshot):
+        return snapshot
+
+    if snapshot["is_loading"]:
+        return snapshot
+
+    with _daily_baseline_lock:
+        if _daily_baseline_cache["is_loading"]:
+            return _snapshot_daily_baseline()
+        _daily_baseline_cache["is_loading"] = True
+        _daily_baseline_cache["last_attempt"] = time.time()
+
+    threading.Thread(
+        target=_refresh_daily_baseline_cache,
+        args=(list(symbols),),
+        daemon=True,
+        name="daily-baseline-refresh",
+    ).start()
+    return _snapshot_daily_baseline()
 
 
 def _apply_neutral_rfactor_fields(sym_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -322,40 +457,11 @@ def fetch_all_sectors() -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"NSE index quote fetch failed: {e}")
 
-    # STEP 2 — Daily yfinance: 20-day volume average baseline (fast; 1d interval, 5d period)
-
-    # Batch yfinance downloads in groups of 30, with 2s sleep and try/except
-    def batch_download(symbols, **kwargs):
-        import time
-        import pandas as pd
-        results = []
-        for i in range(0, len(symbols), 30):
-            batch = symbols[i:i+30]
-            try:
-                df = yf.download(
-                    tickers=" ".join(batch),
-                    **kwargs
-                )
-                if df is not None and not df.empty:
-                    results.append(df)
-            except Exception as exc:
-                logger.warning(f"yfinance batch download failed for {batch}: {exc}")
-            time.sleep(2)
-        if results:
-            return pd.concat(results, axis=1)
-        return None
-
-    logger.info(f"Downloading daily data for volume baseline ({len(ALL_SYMBOLS)} symbols)...")
-    daily_data = batch_download(
-        ALL_SYMBOLS,
-        period="5d",
-        interval="1d",
-        auto_adjust=False,
-        group_by="ticker",
-        progress=False,
-        threads=True,
-        timeout=30,
-    )
+    baseline_snapshot = _ensure_daily_baseline_cache(ALL_SYMBOLS)
+    prev_close_by_symbol = baseline_snapshot.get("prev_close_by_symbol", {})
+    avg_volume_by_symbol = baseline_snapshot.get("avg_volume_by_symbol", {})
+    if not prev_close_by_symbol:
+        logger.info("Daily baseline cache is warming up; using live quote fields and neutral volume ratios for now.")
 
     # STEP 4 — Build sym_data: primary values from SmartAPI, volume_ratio from yfinance daily
     sym_data: Dict[str, Any] = {}
@@ -367,15 +473,11 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
             # Fall back to yfinance daily if NSE quote unavailable
             if not q or q.get("ltp", 0) <= 0:
-                d_df = get_sym_df(daily_data, symbol)
-                if d_df is None:
+                prev_close_fb = _safe_float(prev_close_by_symbol.get(clean))
+                ltp_fb = round(float(angel_price or 0), 2)
+                if ltp_fb <= 0 or prev_close_fb <= 0:
                     continue
-                close_s = d_df["Close"].dropna()
-                if len(close_s) < 2:
-                    continue
-                prev_close_fb = float(close_s.iloc[-2])
-                ltp_fb        = round(float(angel_price or close_s.iloc[-1]), 2)
-                change_fb     = _compute_change_pct(ltp_fb, prev_close_fb)
+                change_fb = _compute_change_pct(ltp_fb, prev_close_fb)
                 sym_data[clean] = {
                     "symbol": clean, "ltp": ltp_fb, "change_pct": change_fb,
                     "volume_ratio": 1.0, "fo": clean in FO_STOCKS,
@@ -392,22 +494,16 @@ def fetch_all_sectors() -> Dict[str, Any]:
             live_ltp = round(float(angel_price or q.get("ltp", 0) or 0), 2)
             prev_close = float(q.get("prev_close", 0) or 0)
             if prev_close <= 0:
-                d_df = get_sym_df(daily_data, symbol)
-                if d_df is not None:
-                    close_s = d_df["Close"].dropna()
-                    if len(close_s) >= 2:
-                        prev_close = float(close_s.iloc[-2])
+                prev_close = _safe_float(prev_close_by_symbol.get(clean))
             change_pct = _compute_change_pct(live_ltp, prev_close, float(q.get("change_pct", 0) or 0))
 
             # Volume ratio: NSE total traded (lakhs → shares) vs 20-day yfinance avg
             vol_ratio = 1.0
             try:
                 nse_vol_shares = q.get("total_traded_volume", 0.0) * 100_000
-                d_df = get_sym_df(daily_data, symbol)
-                if d_df is not None and nse_vol_shares > 0:
-                    avg_20d = float(d_df["Volume"].dropna().tail(20).mean()) if len(d_df["Volume"].dropna()) >= 3 else 0.0
-                    if avg_20d > 0:
-                        vol_ratio = round(nse_vol_shares / avg_20d, 2)
+                avg_20d = _safe_float(avg_volume_by_symbol.get(clean))
+                if avg_20d > 0 and nse_vol_shares > 0:
+                    vol_ratio = round(nse_vol_shares / avg_20d, 2)
             except Exception:
                 pass
 
@@ -443,7 +539,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     logger.info("R-Factor remains disabled — skipping unused 15-minute downloads and filling neutral placeholder fields.")
     sym_data = _apply_neutral_rfactor_fields(sym_data)
-    sym_data = calculate_intraday_boost(sym_data, None, daily_data)
+    sym_data = calculate_intraday_boost(sym_data, None, None)
 
     # STEP 6 — VWAP standard deviation bands (Feature 4)
     # Attaches vwap_position, band_1_upper/lower, band_2_upper/lower to each stock
