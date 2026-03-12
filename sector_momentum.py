@@ -3,7 +3,7 @@
 import os
 os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import mean
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +25,37 @@ _cache_ref: Optional[Any] = None
 # Stores sector_name → change_pct at the 10:00 AM final slot.
 # Populated once at 10:00 snapshot (or by backfill). Persists for the rest of the day.
 _final_snapshot: Dict[str, float] = {}
+
+
+def _normalize_to_naive_ist_index(df):
+    """Convert a dataframe index to naive IST for reliable slot matching."""
+    if df is None or df.empty:
+        return df
+    try:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
+        else:
+            df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    except Exception:
+        pass
+    return df
+
+
+def _get_slot_close(df, target_dt: datetime, max_gap_minutes: int = 7) -> Optional[float]:
+    """Return the closest close at or before the target slot within an acceptable gap."""
+    if df is None or df.empty:
+        return None
+    try:
+        eligible = df[df.index <= target_dt]
+        if eligible.empty:
+            return None
+        last_row = eligible.iloc[-1]
+        last_ts = eligible.index[-1]
+        if (target_dt - last_ts) > timedelta(minutes=max_gap_minutes):
+            return None
+        return float(last_row["Close"])
+    except Exception:
+        return None
 
 
 def set_cache_ref(cache: Any) -> None:
@@ -233,8 +264,7 @@ def backfill_today_snapshots() -> None:
         return
 
     # Normalise index to naive IST
-    if intra_raw.index.tz is not None:
-        intra_raw.index = intra_raw.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    intra_raw = _normalize_to_naive_ist_index(intra_raw)
 
     def get_sym_intra(symbol: str):
         try:
@@ -253,6 +283,7 @@ def backfill_today_snapshots() -> None:
         sector_snaps: Dict[str, float] = {}
         for h, m, label in elapsed_slots:
             changes = []
+            slot_dt = datetime.combine(today, datetime.min.time()).replace(hour=h, minute=m)
             for sym in symbols:
                 df = get_sym_intra(sym)
                 if df is None:
@@ -260,13 +291,10 @@ def backfill_today_snapshots() -> None:
                 prev_close = get_prev_close(sym)
                 if prev_close <= 0:
                     continue
-                # Find the 5-min candle at exactly this slot time
-                mask = (df.index.hour == h) & (df.index.minute == m)
-                rows = df[mask]
-                if rows.empty:
+                slot_close = _get_slot_close(df, slot_dt)
+                if slot_close is None:
                     continue
                 try:
-                    slot_close = float(rows["Close"].iloc[0])
                     changes.append(round((slot_close - prev_close) / prev_close * 100, 2))
                 except Exception:
                     continue
@@ -381,8 +409,7 @@ def get_historical_momentum(target_date: str) -> Dict[str, Any]:
             continue
 
         # ── CRITICAL FIX: Convert UTC index → naive IST BEFORE anything else ──
-        if raw.index.tz is not None:
-            raw.index = raw.index.tz_convert("Asia/Kolkata").tz_localize(None)
+        raw = _normalize_to_naive_ist_index(raw)
 
         # Keep only rows matching target_date in IST
         raw = raw[raw.index.date == target_date_obj]
@@ -423,14 +450,11 @@ def get_historical_momentum(target_date: str) -> Dict[str, Any]:
             changes: List[float] = []
             for sym, df in sym_dfs.items():
                 try:
-                    slot_mask = (df.index.hour == ist_h) & (df.index.minute == ist_m)
-                    slot_rows = df[slot_mask]
-
-                    if slot_rows.empty:
-                        continue
-
                     prev_close = prev_closes.get(sym, 0.0)
-                    slot_close = float(slot_rows["Close"].iloc[0])
+                    slot_dt = datetime.combine(target_date_obj, datetime.min.time()).replace(hour=ist_h, minute=ist_m)
+                    slot_close = _get_slot_close(df, slot_dt)
+                    if slot_close is None:
+                        continue
 
                     if slot == "9:15":
                         logger.info("[DEBUG] %s prev_close=%.2f slot_close=%.2f",
