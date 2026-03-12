@@ -357,18 +357,6 @@ def fetch_all_sectors() -> Dict[str, Any]:
         timeout=30,
     )
 
-    logger.info(f"Downloading 15-min data for RSI/MFI ({len(ALL_SYMBOLS)} symbols)...")
-    data_15min = batch_download(
-        ALL_SYMBOLS,
-        period="5d",
-        interval="15m",
-        auto_adjust=False,
-        group_by="ticker",
-        progress=False,
-        threads=True,
-        timeout=30,
-    )
-
     # STEP 4 — Build sym_data: primary values from SmartAPI, volume_ratio from yfinance daily
     sym_data: Dict[str, Any] = {}
     for symbol in _combined_symbols:
@@ -450,19 +438,10 @@ def fetch_all_sectors() -> Dict[str, Any]:
     logger.info(f"sym_data built for {len(sym_data)} symbols (SmartAPI primary, yfinance fallback).")
 
     # STEP 5 — quote depth data for rfactor (delivery%, bid/ask) — sourced from live quotes
-    nse_data: Dict[str, Any] = {
-        sym: {
-            "delivery_pct":  q.get("delivery_pct") or 0.0,
-            "bid_ask_ratio": q.get("bid_ask_ratio") or 1.0,
-            "bid_qty":       q.get("bid_qty") or 0,
-            "ask_qty":       q.get("ask_qty") or 0,
-        }
-        for sym, q in nse_full.items()
-    }
-    if not nse_data:
-        logger.warning("Live depth data empty — rfactor will use neutral delivery/bid values.")
+    if not nse_full:
+        logger.warning("Live depth data empty — using neutral placeholder values.")
 
-    logger.info("R-Factor computation disabled — using neutral placeholder fields to keep refresh cycle light.")
+    logger.info("R-Factor remains disabled — skipping unused 15-minute downloads and filling neutral placeholder fields.")
     sym_data = _apply_neutral_rfactor_fields(sym_data)
     sym_data = calculate_intraday_boost(sym_data, None, daily_data)
 
