@@ -621,6 +621,21 @@ def _nifty_change_from_sources(raw: Optional[pd.DataFrame]) -> float:
     except Exception as exc:
         logger.warning("Momentum Pulse Nifty quote fetch failed, using history fallback: %s", exc)
 
+    if raw is None:
+        try:
+            raw = yf.download(
+                tickers="^NSEI",
+                period="5d",
+                interval="5m",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning("Momentum Pulse Nifty history download failed: %s", exc)
+            raw = None
+
     nifty_df = _get_sym_df(raw, "^NSEI")
     sessions = _split_sessions(nifty_df)
     if len(sessions) >= 2:
