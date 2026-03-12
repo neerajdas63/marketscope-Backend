@@ -498,6 +498,80 @@ def _time_adjustment(score_time_bucket: str, pulse_trend_label: str) -> Tuple[fl
     return -0.8, 0.97
 
 
+def _classify_behavior_state(
+    latest_ts: datetime,
+    pulse_trend_label: str,
+    pulse_trend_strength: float,
+    score_change_10m: float,
+    score_change_15m: float,
+    improving_streak: int,
+    weakening_streak: int,
+    distance_from_vwap_pct: float,
+    is_extended: bool,
+    warning_flags: Sequence[str],
+) -> str:
+    """Classify displayed state from behavior, using time only as a minor modifier."""
+    flags = {str(flag) for flag in warning_flags}
+    abs_distance = abs(_safe_float(distance_from_vwap_pct))
+
+    is_afternoon = latest_ts.time() >= dt_time(13, 0)
+    is_late_afternoon = latest_ts.time() >= dt_time(14, 0)
+
+    # Time only tightens EARLY slightly later in the session; it does not force LATE.
+    early_trend_floor = 55.0 + (4.0 if is_afternoon else 0.0) + (3.0 if is_late_afternoon else 0.0)
+    early_change_10m_floor = 2.0 + (0.4 if is_afternoon else 0.0) + (0.3 if is_late_afternoon else 0.0)
+    early_change_15m_floor = 3.0 + (0.5 if is_afternoon else 0.0) + (0.5 if is_late_afternoon else 0.0)
+
+    extension_risk_count = sum(
+        1
+        for flag in ("far_from_vwap", "one_bar_spike", "fading_score", "low_volume_confirmation")
+        if flag in flags
+    )
+
+    if is_extended or abs_distance >= 1.8:
+        return "EXTENDED"
+    if "far_from_vwap" in flags and extension_risk_count >= 2 and abs_distance >= 1.1:
+        return "EXTENDED"
+
+    if (
+        pulse_trend_label == "Rising"
+        and pulse_trend_strength >= early_trend_floor
+        and score_change_10m >= early_change_10m_floor
+        and score_change_15m >= early_change_15m_floor
+        and improving_streak >= 2
+        and weakening_streak == 0
+        and abs_distance <= 1.0
+        and "far_from_vwap" not in flags
+        and "fading_score" not in flags
+    ):
+        return "EARLY"
+
+    if (
+        abs_distance <= 1.25
+        and "far_from_vwap" not in flags
+        and extension_risk_count <= 1
+        and weakening_streak <= 1
+        and (
+            (
+                pulse_trend_label == "Rising"
+                and pulse_trend_strength >= 38.0
+                and score_change_10m >= -0.5
+                and score_change_15m >= 0.5
+            )
+            or (
+                pulse_trend_label == "Flat"
+                and pulse_trend_strength >= 42.0
+                and score_change_10m >= 0.0
+                and score_change_15m >= 1.0
+                and improving_streak >= 1
+            )
+        )
+    ):
+        return "ACTIVE"
+
+    return "LATE"
+
+
 def _fallback_prev_close(stock: Dict[str, Any], session_df: pd.DataFrame) -> float:
     live_price = _safe_float(stock.get("ltp"))
     change_pct = _safe_float(stock.get("change_pct"))
@@ -708,6 +782,18 @@ def _evaluate_symbol(
         volume_pace_ratio,
         is_extended,
     )
+    behavior_state = _classify_behavior_state(
+        latest_ts=latest_ts,
+        pulse_trend_label=pulse_trend_label,
+        pulse_trend_strength=pulse_trend_strength,
+        score_change_10m=_safe_float(committed_trend.get("score_change_10m")),
+        score_change_15m=_safe_float(committed_trend.get("score_change_15m")),
+        improving_streak=int(committed_trend.get("improving_streak", 0) or 0),
+        weakening_streak=int(committed_trend.get("weakening_streak", 0) or 0),
+        distance_from_vwap_pct=distance_from_vwap_pct,
+        is_extended=is_extended,
+        warning_flags=warning_flags,
+    )
 
     return {
         "symbol": stock.get("symbol"),
@@ -746,7 +832,9 @@ def _evaluate_symbol(
         "pulse_trend_label": pulse_trend_label,
         "vwap": round(vwap, 2),
         "distance_from_vwap_pct": round(distance_from_vwap_pct, 2),
-        "score_time_bucket": score_time_bucket,
+        "score_time_bucket": behavior_state,
+        "time_context_bucket": score_time_bucket,
+        "behavior_state": behavior_state,
         "is_extended": is_extended,
         "warning_flags": warning_flags,
         "volume_surge": volume_pace_ratio >= 1.5,
