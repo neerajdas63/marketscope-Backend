@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cache import InMemoryCache
 from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
+from backend.sequence_signals import get_sequence_signals
 from fetcher import fetch_all_sectors
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -417,6 +418,41 @@ async def get_intraday_boost(
         "total": len(all_stocks),
         "last_updated": cached.get("last_updated", ""),
     }
+
+
+@app.get("/sequence-signals", summary="Today's OB + FVG + MTF sequence strategy signals", tags=["Market Data"])
+async def get_sequence_strategy_signals(
+    limit: int = 200,
+    timeframe: str = "ALL",
+    side: str = "ALL",
+    signal_type: str = "ALL",
+    session_date: str = "",
+) -> Dict[str, Any]:
+    """
+    Returns today's strategy signals generated from the backend sequence engine.
+
+    Query params:
+    - limit: number of signals to return (default 200)
+    - timeframe: ALL | 3m | 5m | 15m
+    - side: ALL | BUY | SELL
+    - signal_type: ALL | C2 | C3 | MTF
+    - session_date: optional YYYY-MM-DD override, defaults to today in IST
+    """
+    cached = cache.get() or {}
+
+    try:
+        return get_sequence_signals(
+            symbols=[str(item.get("symbol") or "") for item in cached.get("scanner_stocks", []) if str(item.get("symbol") or "")],
+            timeframe=timeframe,
+            side=side,
+            signal_type=signal_type,
+            limit=limit,
+            session_date=session_date or None,
+            market_data_last_updated=str(cached.get("last_updated", "") or ""),
+        )
+    except Exception as exc:
+        logger.error("Sequence Signals endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Sequence Signals computation failed") from exc
 
 
 @app.get("/sector-scope", summary="Intra-sector relative strength ranking", tags=["Market Data"])
