@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cache import InMemoryCache
 from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
+from backend.pulse_navigator import get_pulse_navigator, get_pulse_navigator_tab
 from fetcher import fetch_all_sectors
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -311,6 +312,110 @@ async def momentum_pulse_endpoint(
     except Exception as exc:
         logger.error("Momentum Pulse endpoint error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Momentum Pulse computation failed") from exc
+
+
+@app.get("/pulse-navigator", summary="Curated discovery upgrade built on Momentum Pulse", tags=["Market Data"])
+async def pulse_navigator_endpoint(
+    limit: int = 12,
+    preset: str = "balanced",
+    direction: str = "ALL",
+) -> Dict[str, Any]:
+    cached = cache.get()
+    if not cached:
+        return _warming_up_response(
+            message="Pulse Navigator is warming up",
+            feature="Pulse Navigator",
+            feature_key="pulse_navigator",
+            tabs={
+                "discover": {"tab": "discover", "title": "Discover", "buckets": []},
+                "fresh": {"tab": "fresh", "title": "Fresh Movers", "stocks": []},
+                "sectors": {"tab": "sectors", "title": "Sector Leaders", "sectors": []},
+            },
+        )
+
+    try:
+        return get_pulse_navigator(
+            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            last_updated=str(cached.get("last_updated", "") or ""),
+            preset=preset,
+            direction=direction,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Pulse Navigator endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Pulse Navigator computation failed") from exc
+
+
+@app.get("/pulse-navigator/discover", summary="Pulse Navigator discover tab", tags=["Market Data"])
+async def pulse_navigator_discover_endpoint(
+    limit: int = 12,
+    preset: str = "balanced",
+    direction: str = "ALL",
+) -> Dict[str, Any]:
+    cached = cache.get()
+    if not cached:
+        return _warming_up_response(message="Pulse Navigator discover tab is warming up", tab={"tab": "discover", "title": "Discover", "buckets": []})
+
+    try:
+        return get_pulse_navigator_tab(
+            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            last_updated=str(cached.get("last_updated", "") or ""),
+            tab="discover",
+            preset=preset,
+            direction=direction,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Pulse Navigator discover endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Pulse Navigator discover computation failed") from exc
+
+
+@app.get("/pulse-navigator/fresh", summary="Pulse Navigator fresh movers tab", tags=["Market Data"])
+async def pulse_navigator_fresh_endpoint(
+    limit: int = 12,
+    preset: str = "balanced",
+    direction: str = "ALL",
+) -> Dict[str, Any]:
+    cached = cache.get()
+    if not cached:
+        return _warming_up_response(message="Pulse Navigator fresh tab is warming up", tab={"tab": "fresh", "title": "Fresh Movers", "stocks": []})
+
+    try:
+        return get_pulse_navigator_tab(
+            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            last_updated=str(cached.get("last_updated", "") or ""),
+            tab="fresh",
+            preset=preset,
+            direction=direction,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Pulse Navigator fresh endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Pulse Navigator fresh computation failed") from exc
+
+
+@app.get("/pulse-navigator/sectors", summary="Pulse Navigator sector leaders tab", tags=["Market Data"])
+async def pulse_navigator_sectors_endpoint(
+    limit: int = 12,
+    preset: str = "balanced",
+    direction: str = "ALL",
+) -> Dict[str, Any]:
+    cached = cache.get()
+    if not cached:
+        return _warming_up_response(message="Pulse Navigator sectors tab is warming up", tab={"tab": "sectors", "title": "Sector Leaders", "sectors": []})
+
+    try:
+        return get_pulse_navigator_tab(
+            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            last_updated=str(cached.get("last_updated", "") or ""),
+            tab="sectors",
+            preset=preset,
+            direction=direction,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Pulse Navigator sectors endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Pulse Navigator sectors computation failed") from exc
 
 
 @app.get("/scanner", summary="Scan stocks by change, volume, direction and sector", tags=["Market Data"])
