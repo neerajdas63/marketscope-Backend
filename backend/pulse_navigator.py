@@ -341,12 +341,14 @@ def get_pulse_navigator(
         include_veryweak=True,
         limit=max(DEFAULT_FETCH_LIMIT, limit * 8, len(scanner_stocks)),
     )
+    pulse_status = str(pulse_result.get("status") or "warming_up")
+    pulse_stocks = list(pulse_result.get("stocks") or [])
 
-    if str(pulse_result.get("status") or "") != "ready":
+    if pulse_status == "warming_up" and not pulse_stocks:
         return {
             "feature": "Pulse Navigator",
             "feature_key": "pulse_navigator",
-            "status": str(pulse_result.get("status") or "warming_up"),
+            "status": pulse_status,
             "message": str(pulse_result.get("message") or "Momentum data is warming up"),
             "last_updated": str(pulse_result.get("last_updated") or last_updated),
             "market_data_last_updated": str(pulse_result.get("market_data_last_updated") or last_updated),
@@ -360,7 +362,7 @@ def get_pulse_navigator(
             "direction": normalized_direction,
         }
 
-    raw_items = [_decorate_item(item) for item in pulse_result.get("stocks") or []]
+    raw_items = [_decorate_item(item) for item in pulse_stocks]
     filtered_items = _apply_preset_filters(raw_items, normalized_preset, normalized_direction)
     source_key = _source_key(str(pulse_result.get("last_updated") or last_updated), len(raw_items))
 
@@ -372,7 +374,8 @@ def get_pulse_navigator(
     return {
         "feature": "Pulse Navigator",
         "feature_key": "pulse_navigator",
-        "status": "ready",
+        "status": pulse_status if pulse_status in {"ready", "stale_refreshing"} else "ready",
+        "message": str(pulse_result.get("message") or ""),
         "last_updated": str(pulse_result.get("last_updated") or last_updated),
         "market_data_last_updated": str(pulse_result.get("market_data_last_updated") or last_updated),
         "benchmark_change_pct": _safe_float(pulse_result.get("benchmark_change_pct")),
