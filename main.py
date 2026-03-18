@@ -11,9 +11,11 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from backend.auth_access import authorize_request
 from cache import InMemoryCache
 from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
 from backend.pulse_navigator import get_pulse_navigator, get_pulse_navigator_tab
@@ -218,6 +220,27 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
+
+
+_PUBLIC_PATHS = {"/", "/health", "/openapi.json", "/docs", "/redoc", "/favicon.ico"}
+_PUBLIC_PREFIXES = ("/docs", "/redoc")
+
+
+@app.middleware("http")
+async def access_control_middleware(request: Request, call_next):
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path or "/"
+    if path in _PUBLIC_PATHS or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES):
+        return await call_next(request)
+
+    try:
+        request.state.current_user = await authorize_request(request.headers.get("Authorization", ""))
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
