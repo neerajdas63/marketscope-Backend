@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pytz
-from upstox_client import get_nearest_option_expiry, get_option_chain as get_upstox_option_chain, get_underlying_snapshot
+from upstox_client import get_nearest_option_expiry, get_option_chain as get_upstox_option_chain, get_underlying_snapshot, is_upstox_configured
 _IST = pytz.timezone("Asia/Kolkata")
 
 logger = logging.getLogger("oi_analysis")
@@ -175,6 +175,8 @@ def _compute_oi_analysis_from_compact_records(
 
 
 def _get_upstox_oi_analysis(symbol: str) -> Dict[str, Any]:
+    if not is_upstox_configured():
+        return {}
     payload = get_upstox_option_chain(symbol)
     rows = list(payload.get("data") or [])
     if not rows:
@@ -327,9 +329,10 @@ def get_oi_analysis(symbol: str) -> Dict[str, Any]:
         max_pain, support_strikes, resistance_strikes
     """
     try:
-        upstox_result = _get_upstox_oi_analysis(symbol)
-        if upstox_result:
-            return upstox_result
+        if is_upstox_configured():
+            upstox_result = _get_upstox_oi_analysis(symbol)
+            if upstox_result:
+                return upstox_result
 
         return _get_nse_oi_analysis(symbol)
 

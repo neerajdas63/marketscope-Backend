@@ -47,6 +47,22 @@ _option_expiry_cache: Dict[str, tuple[float, List[str]]] = {}
 _history_lock = threading.Lock()
 _history_cache: Dict[tuple[str, str, str, int, str], tuple[float, pd.DataFrame]] = {}
 
+_config_warning_lock = threading.Lock()
+_missing_token_warned = False
+
+
+def _warn_missing_token_once() -> None:
+    global _missing_token_warned
+    with _config_warning_lock:
+        if _missing_token_warned:
+            return
+        logger.warning("Upstox disabled: missing environment variable UPSTOX_ACCESS_TOKEN. Using fallback providers.")
+        _missing_token_warned = True
+
+
+def is_upstox_configured() -> bool:
+    return bool(str(os.getenv("UPSTOX_ACCESS_TOKEN", "") or "").strip())
+
 
 def _require_token() -> str:
     token = str(os.getenv("UPSTOX_ACCESS_TOKEN", "") or "").strip()
@@ -143,6 +159,9 @@ def _load_instrument_cache(force_refresh: bool = False) -> Dict[str, Dict[str, s
 
 
 def get_symbol_instrument_keys(symbols: Iterable[str]) -> Dict[str, str]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return {}
     instrument_cache = _load_instrument_cache()
     result: Dict[str, str] = {}
     for symbol in symbols:
@@ -195,6 +214,9 @@ def _normalize_history_date_range(from_date: str, to_date: str) -> tuple[str, st
 
 
 def _search_instruments(query: str, exchanges: str, segments: str, records: int = 10) -> List[Dict[str, Any]]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return []
     cache_key = (str(query or "").strip().upper(), exchanges.upper(), segments.upper())
     with _search_lock:
         cached = _search_cache.get(cache_key)
@@ -333,6 +355,9 @@ def _fetch_symbol_history_frame(symbol: str, from_date: str, to_date: str, inter
 
 
 def get_intraday_history_batch(symbols: Sequence[str], from_date: str, to_date: str, interval_minutes: int = 5) -> Optional[pd.DataFrame]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return None
     labels = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
     if not labels:
         return None
@@ -379,6 +404,9 @@ def _fetch_symbol_daily_history_frame(symbol: str, from_date: str, to_date: str)
 
 
 def get_daily_history_batch(symbols: Sequence[str], from_date: str, to_date: str) -> Optional[pd.DataFrame]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return None
     labels = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
     if not labels:
         return None
@@ -404,6 +432,9 @@ def get_daily_history_batch(symbols: Sequence[str], from_date: str, to_date: str
 
 
 def get_bulk_full_quotes(symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return {}
     normalized_symbols = [_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)]
     result: Dict[str, Dict[str, Any]] = {}
     missing: List[str] = []
@@ -465,6 +496,9 @@ def get_bulk_full_quotes(symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
 
 
 def get_underlying_instrument_key(symbol: str) -> Optional[str]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return None
     normalized = _normalize_symbol(symbol)
     if not normalized:
         return None
@@ -498,6 +532,9 @@ def get_underlying_instrument_key(symbol: str) -> Optional[str]:
 
 
 def get_full_quotes_by_instrument_keys(instrument_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return {}
     keys = [str(key or "").strip() for key in instrument_keys if str(key or "").strip()]
     result: Dict[str, Dict[str, Any]] = {}
     for chunk in _chunked(keys, _CHUNK_SIZE):
@@ -515,6 +552,9 @@ def get_full_quotes_by_instrument_keys(instrument_keys: Iterable[str]) -> Dict[s
 
 
 def get_underlying_snapshot(symbol: str) -> Dict[str, Any]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return {}
     instrument_key = get_underlying_instrument_key(symbol)
     if not instrument_key:
         return {}
@@ -532,6 +572,9 @@ def get_underlying_snapshot(symbol: str) -> Dict[str, Any]:
 
 
 def get_option_contract_expiries(symbol: str) -> List[str]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return []
     instrument_key = get_underlying_instrument_key(symbol)
     if not instrument_key:
         return []
@@ -561,6 +604,9 @@ def get_nearest_option_expiry(symbol: str) -> str:
 
 
 def get_option_chain(symbol: str, expiry_date: Optional[str] = None) -> Dict[str, Any]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return {}
     instrument_key = get_underlying_instrument_key(symbol)
     if not instrument_key:
         return {}
@@ -581,6 +627,9 @@ def get_option_chain(symbol: str, expiry_date: Optional[str] = None) -> Dict[str
 
 
 def get_bulk_daily_ohlc(symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    if not is_upstox_configured():
+        _warn_missing_token_once()
+        return {}
     normalized_symbols = [_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)]
     result: Dict[str, Dict[str, Any]] = {}
 
