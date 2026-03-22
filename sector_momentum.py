@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import pytz
 
+from upstox_client import get_daily_history_batch, get_intraday_history_batch
+
 logger = logging.getLogger("sector_momentum")
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -25,6 +27,30 @@ _cache_ref: Optional[Any] = None
 # Stores sector_name → change_pct at the 10:00 AM final slot.
 # Populated once at 10:00 snapshot (or by backfill). Persists for the rest of the day.
 _final_snapshot: Dict[str, float] = {}
+
+
+def _extract_symbol_frame(raw: Any, symbol: str):
+    if raw is None:
+        return None
+    try:
+        import pandas as pd
+
+        if not isinstance(raw, pd.DataFrame) or raw.empty:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            level0 = raw.columns.get_level_values(0)
+            level1 = raw.columns.get_level_values(1)
+            if symbol in level0:
+                df = raw[symbol]
+            elif symbol in level1:
+                df = raw.xs(symbol, axis=1, level=1)
+            else:
+                return None
+        else:
+            df = raw
+        return df if df is not None and not df.empty else None
+    except Exception:
+        return None
 
 
 def _normalize_to_naive_ist_index(df):
@@ -159,7 +185,6 @@ def backfill_today_snapshots() -> None:
     import os
     os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
-    import pandas as pd
 
     now = datetime.now(IST)
     today = now.date()
@@ -180,29 +205,26 @@ def backfill_today_snapshots() -> None:
 
     logger.info("Backfilling %d elapsed opening slots for today (%s)...", len(elapsed_slots), today)
 
-    all_symbols = [
-        sym if sym.endswith(".NS") else sym + ".NS"
-        for syms in SECTORS.values()
-        for sym in syms
-    ]
-    # Use sample of first 5 per sector (mirrors get_historical_momentum)
     sector_samples = {
         name: [(s if s.endswith(".NS") else s + ".NS") for s in syms[:5]]
         for name, syms in SECTORS.items()
     }
     sampled_symbols = list({s for syms in sector_samples.values() for s in syms})
-    tickers_str = " ".join(sampled_symbols)
+    from_date = (today - timedelta(days=14)).isoformat()
+    to_date = today.isoformat()
 
-    # ── Daily data for prev_close ─────────────────────────────────────────────
-    import time as _time
-    import pandas as pd
-    # Batch daily download
-    daily_batches = []
-    for i in range(0, len(sampled_symbols), 30):
-        batch = sampled_symbols[i:i+30]
+    daily_raw = None
+    try:
+        daily_raw = get_daily_history_batch(sampled_symbols, from_date=from_date, to_date=to_date)
+    except Exception as exc:
+        logger.warning("Backfill: Upstox daily history failed: %s", exc)
+
+    daily_fallback = None
+    missing_daily = [symbol for symbol in sampled_symbols if _extract_symbol_frame(daily_raw, symbol) is None]
+    if missing_daily:
         try:
-            df = yf.download(
-                tickers=" ".join(batch),
+            daily_fallback = yf.download(
+                tickers=" ".join(missing_daily),
                 period="5d",
                 interval="1d",
                 auto_adjust=False,
@@ -211,36 +233,35 @@ def backfill_today_snapshots() -> None:
                 threads=True,
                 timeout=30,
             )
-            if df is not None and not df.empty:
-                daily_batches.append(df)
         except Exception as exc:
-            logger.warning(f"Backfill: daily batch failed: {exc}")
-        _time.sleep(2)
-    if daily_batches:
-        daily_raw = pd.concat(daily_batches, axis=1)
-    else:
-        daily_raw = None
+            logger.warning("Backfill: daily yfinance fallback failed: %s", exc)
 
     def get_prev_close(symbol: str) -> float:
-        try:
-            if isinstance(daily_raw.columns, pd.MultiIndex):
-                if symbol not in daily_raw.columns.get_level_values(0):
-                    return 0.0
-                closes = daily_raw[symbol]["Close"].dropna()
-            else:
-                closes = daily_raw["Close"].dropna()
-            return float(closes.iloc[-2]) if len(closes) >= 2 else 0.0
-        except Exception:
-            return 0.0
+        for raw in (daily_raw, daily_fallback):
+            df = _extract_symbol_frame(raw, symbol)
+            if df is None or df.empty or "Close" not in df.columns:
+                continue
+            try:
+                clean_df = _normalize_to_naive_ist_index(df.copy())
+                closes = clean_df[clean_df.index.date < today]["Close"].dropna()
+                if not closes.empty:
+                    return float(closes.iloc[-1])
+            except Exception:
+                continue
+        return 0.0
 
-    # ── Intraday data for today ───────────────────────────────────────────────
-    # Batch intraday download
-    intra_batches = []
-    for i in range(0, len(sampled_symbols), 30):
-        batch = sampled_symbols[i:i+30]
+    intra_raw = None
+    try:
+        intra_raw = get_intraday_history_batch(sampled_symbols, from_date=to_date, to_date=to_date, interval_minutes=5)
+    except Exception as exc:
+        logger.warning("Backfill: Upstox intraday history failed: %s", exc)
+
+    intra_fallback = None
+    missing_intra = [symbol for symbol in sampled_symbols if _extract_symbol_frame(intra_raw, symbol) is None]
+    if missing_intra:
         try:
-            df = yf.download(
-                tickers=" ".join(batch),
+            intra_fallback = yf.download(
+                tickers=" ".join(missing_intra),
                 period="1d",
                 interval="5m",
                 auto_adjust=False,
@@ -249,34 +270,23 @@ def backfill_today_snapshots() -> None:
                 threads=True,
                 timeout=30,
             )
-            if df is not None and not df.empty:
-                intra_batches.append(df)
         except Exception as exc:
-            logger.warning(f"Backfill: intraday batch failed: {exc}")
-        _time.sleep(2)
-    if intra_batches:
-        intra_raw = pd.concat(intra_batches, axis=1)
-    else:
-        intra_raw = None
+            logger.warning("Backfill: intraday yfinance fallback failed: %s", exc)
 
-    if intra_raw is None or intra_raw.empty:
+    if (intra_raw is None or intra_raw.empty) and (intra_fallback is None or intra_fallback.empty):
         logger.warning("Backfill: empty intraday data")
         return
 
-    # Normalise index to naive IST
-    intra_raw = _normalize_to_naive_ist_index(intra_raw)
-
     def get_sym_intra(symbol: str):
-        try:
-            if isinstance(intra_raw.columns, pd.MultiIndex):
-                if symbol not in intra_raw.columns.get_level_values(0):
-                    return None
-                df = intra_raw[symbol]
-            else:
-                df = intra_raw
-            return df if not df.empty else None
-        except Exception:
-            return None
+        for raw in (intra_raw, intra_fallback):
+            df = _extract_symbol_frame(raw, symbol)
+            if df is None or df.empty:
+                continue
+            df = _normalize_to_naive_ist_index(df.copy())
+            df = df[df.index.date == today]
+            if not df.empty:
+                return df
+        return None
 
     # ── Build snapshots per sector ────────────────────────────────────────────
     for sector_name, symbols in sector_samples.items():
@@ -326,7 +336,6 @@ def backfill_today_snapshots() -> None:
 
 def get_historical_momentum(target_date: str) -> Dict[str, Any]:
     import yfinance as yf
-    import pandas as pd
     from datetime import timedelta
     from stocks import SECTORS
 
@@ -347,52 +356,47 @@ def get_historical_momentum(target_date: str) -> Dict[str, Any]:
         "10:00": (10,  0),
     }
 
-    result_data: Dict[str, Dict[str, float]] = {}
+    sector_samples = {
+        sector_name: [sym if sym.endswith(".NS") else sym + ".NS" for sym in list(symbols)[:5]]
+        for sector_name, symbols in SECTORS.items()
+    }
+    sampled_symbols = list({symbol for symbols in sector_samples.values() for symbol in symbols})
+    daily_from_date = (dt - timedelta(days=10)).strftime("%Y-%m-%d")
 
-    for sector_name, symbols in SECTORS.items():
-        sample = list(symbols)[:5]
-        tickers_str = " ".join(s + ".NS" if not s.endswith(".NS") else s for s in sample)
+    daily_raw = None
+    try:
+        daily_raw = get_daily_history_batch(sampled_symbols, from_date=daily_from_date, to_date=target_date)
+    except Exception as exc:
+        logger.warning("Historical momentum Upstox daily fetch failed: %s", exc)
 
-        # ── Fetch previous trading day's close (same baseline the heatmap uses) ──
-        prev_closes: Dict[str, float] = {}
+    daily_fallback = None
+    missing_daily = [symbol for symbol in sampled_symbols if _extract_symbol_frame(daily_raw, symbol) is None]
+    if missing_daily:
         try:
-            daily_raw = yf.download(
-                tickers=tickers_str,
-                start=(dt - timedelta(days=7)).strftime("%Y-%m-%d"),
-                end=target_date,   # exclusive → last row = prev trading day
+            daily_fallback = yf.download(
+                tickers=" ".join(missing_daily),
+                start=daily_from_date,
+                end=target_date,
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
                 threads=True,
             )
-            if daily_raw is not None and not daily_raw.empty:
-                if daily_raw.index.tz is not None:
-                    daily_raw.index = daily_raw.index.tz_convert("Asia/Kolkata").tz_localize(None)
-                if isinstance(daily_raw.columns, pd.MultiIndex):
-                    for sym in sample:
-                        sym_ns = sym if sym.endswith(".NS") else sym + ".NS"
-                        try:
-                            avail = daily_raw.columns.get_level_values(1).unique().tolist()
-                            if sym_ns in avail:
-                                sym_daily = daily_raw.xs(sym_ns, axis=1, level=1)
-                                closes = sym_daily["Close"].dropna()
-                                if not closes.empty:
-                                    prev_closes[sym_ns] = float(closes.iloc[-1])
-                        except Exception:
-                            pass
-                else:
-                    sym_ns = sample[0] if sample[0].endswith(".NS") else sample[0] + ".NS"
-                    closes = daily_raw["Close"].dropna()
-                    if not closes.empty:
-                        prev_closes[sym_ns] = float(closes.iloc[-1])
         except Exception as exc:
-            logger.warning("Daily prev_close download failed for %s: %s", sector_name, exc)
+            logger.warning("Historical momentum daily yfinance fallback failed: %s", exc)
 
-        logger.info("Sector %s prev_closes: %s", sector_name, prev_closes)
+    intra_raw = None
+    try:
+        intra_raw = get_intraday_history_batch(sampled_symbols, from_date=target_date, to_date=target_date, interval_minutes=5)
+    except Exception as exc:
+        logger.warning("Historical momentum Upstox intraday fetch failed: %s", exc)
 
+    intra_fallback = None
+    missing_intra = [symbol for symbol in sampled_symbols if _extract_symbol_frame(intra_raw, symbol) is None]
+    if missing_intra:
         try:
-            raw = yf.download(
-                tickers=tickers_str,
+            intra_fallback = yf.download(
+                tickers=" ".join(missing_intra),
                 start=target_date,
                 end=next_day,
                 interval="5m",
@@ -401,45 +405,39 @@ def get_historical_momentum(target_date: str) -> Dict[str, Any]:
                 threads=True,
             )
         except Exception as exc:
-            logger.warning("Historical download failed for %s: %s", sector_name, exc)
-            continue
+            logger.warning("Historical momentum intraday yfinance fallback failed: %s", exc)
 
-        if raw is None or raw.empty:
-            logger.warning("Empty download for sector %s", sector_name)
-            continue
+    result_data: Dict[str, Dict[str, float]] = {}
 
-        # ── CRITICAL FIX: Convert UTC index → naive IST BEFORE anything else ──
-        raw = _normalize_to_naive_ist_index(raw)
-
-        # Keep only rows matching target_date in IST
-        raw = raw[raw.index.date == target_date_obj]
-
-        if raw.empty:
-            logger.warning("No IST rows for %s on %s", sector_name, target_date)
-            continue
-
-        logger.info("Sector %s: %d rows after IST filter, first=%s",
-                    sector_name, len(raw), raw.index[0])
-
-        # Build {symbol: df} — MultiIndex is (field, symbol)
+    for sector_name, sample_symbols in sector_samples.items():
+        prev_closes: Dict[str, float] = {}
         sym_dfs: Dict[str, Any] = {}
-        if isinstance(raw.columns, pd.MultiIndex):
-            available_syms = raw.columns.get_level_values(1).unique().tolist()
-            for sym in sample:
-                sym_ns = sym if sym.endswith(".NS") else sym + ".NS"
-                if sym_ns in available_syms:
-                    try:
-                        df = raw.xs(sym_ns, axis=1, level=1)
-                        if not df.empty:
-                            sym_dfs[sym_ns] = df
-                    except Exception as e:
-                        logger.warning("xs failed for %s: %s", sym_ns, e)
-        else:
-            # Single ticker
-            sym_key = sample[0]
-            sym_key = sym_key if sym_key.endswith(".NS") else sym_key + ".NS"
-            sym_dfs[sym_key] = raw
 
+        for sym_ns in sample_symbols:
+            for raw in (daily_raw, daily_fallback):
+                daily_df = _extract_symbol_frame(raw, sym_ns)
+                if daily_df is None or daily_df.empty or "Close" not in daily_df.columns:
+                    continue
+                try:
+                    clean_daily_df = _normalize_to_naive_ist_index(daily_df.copy())
+                    closes = clean_daily_df[clean_daily_df.index.date < target_date_obj]["Close"].dropna()
+                    if not closes.empty:
+                        prev_closes[sym_ns] = float(closes.iloc[-1])
+                        break
+                except Exception:
+                    continue
+
+            for raw in (intra_raw, intra_fallback):
+                intra_df = _extract_symbol_frame(raw, sym_ns)
+                if intra_df is None or intra_df.empty:
+                    continue
+                clean_intra_df = _normalize_to_naive_ist_index(intra_df.copy())
+                clean_intra_df = clean_intra_df[clean_intra_df.index.date == target_date_obj]
+                if not clean_intra_df.empty:
+                    sym_dfs[sym_ns] = clean_intra_df
+                    break
+
+        logger.info("Sector %s prev_closes: %s", sector_name, prev_closes)
         logger.info("Sector %s: %d symbols available", sector_name, len(sym_dfs))
 
         if not sym_dfs:
@@ -453,15 +451,9 @@ def get_historical_momentum(target_date: str) -> Dict[str, Any]:
                     prev_close = prev_closes.get(sym, 0.0)
                     slot_dt = datetime.combine(target_date_obj, datetime.min.time()).replace(hour=ist_h, minute=ist_m)
                     slot_close = _get_slot_close(df, slot_dt)
-                    if slot_close is None:
+                    if slot_close is None or prev_close <= 0:
                         continue
-
-                    if slot == "9:15":
-                        logger.info("[DEBUG] %s prev_close=%.2f slot_close=%.2f",
-                                    sym, prev_close, slot_close)
-
-                    if prev_close > 0:
-                        changes.append(round((slot_close - prev_close) / prev_close * 100, 2))
+                    changes.append(round((slot_close - prev_close) / prev_close * 100, 2))
                 except Exception:
                     continue
 

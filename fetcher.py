@@ -15,6 +15,7 @@ os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import yfinance as yf
 
 from angel_client import get_bulk_ltp, get_bulk_full_quotes
+from upstox_client import get_bulk_daily_ohlc, get_bulk_full_quotes as get_upstox_bulk_full_quotes
 from stocks import ALL_SYMBOLS, SECTORS, FO_STOCKS, SCANNER_STOCKS
 from nse_fetcher import fetch_nse_index_quotes
 from intraday_boost import calculate_intraday_boost
@@ -120,6 +121,19 @@ def _daily_baseline_is_stale(snapshot: Dict[str, Any]) -> bool:
 def _refresh_daily_baseline_cache(symbols: List[str]) -> None:
     try:
         logger.info("Refreshing daily baseline cache for %d symbols...", len(symbols))
+        upstox_prev_close_by_symbol: Dict[str, float] = {}
+        try:
+            ohlc_rows = get_bulk_daily_ohlc([symbol.replace(".NS", "") for symbol in symbols])
+            upstox_prev_close_by_symbol = {
+                symbol: _safe_float(payload.get("prev_close"))
+                for symbol, payload in ohlc_rows.items()
+                if _safe_float(payload.get("prev_close")) > 0
+            }
+            if upstox_prev_close_by_symbol:
+                logger.info("Upstox daily OHLC provided prev-close data for %d symbols.", len(upstox_prev_close_by_symbol))
+        except Exception as exc:
+            logger.warning("Upstox daily OHLC baseline fetch failed: %s", exc)
+
         daily_data = _batch_download(
             symbols,
             period="5d",
@@ -133,6 +147,9 @@ def _refresh_daily_baseline_cache(symbols: List[str]) -> None:
         prev_close_by_symbol: Dict[str, float] = {}
         avg_volume_by_symbol: Dict[str, float] = {}
         for symbol in symbols:
+            clean_symbol = symbol.replace(".NS", "")
+            if _safe_float(upstox_prev_close_by_symbol.get(clean_symbol)) > 0:
+                prev_close_by_symbol[clean_symbol] = _safe_float(upstox_prev_close_by_symbol.get(clean_symbol))
             df = _get_sym_df(daily_data, symbol)
             if df is None:
                 continue
@@ -140,12 +157,12 @@ def _refresh_daily_baseline_cache(symbols: List[str]) -> None:
             volume_series = df.get("Volume")
             if close_series is not None:
                 close_values = close_series.dropna()
-                if len(close_values) >= 2:
-                    prev_close_by_symbol[symbol.replace(".NS", "")] = _safe_float(close_values.iloc[-2])
+                if len(close_values) >= 2 and clean_symbol not in prev_close_by_symbol:
+                    prev_close_by_symbol[clean_symbol] = _safe_float(close_values.iloc[-2])
             if volume_series is not None:
                 volume_values = volume_series.dropna()
                 if len(volume_values) >= 3:
-                    avg_volume_by_symbol[symbol.replace(".NS", "")] = float(volume_values.tail(20).mean())
+                    avg_volume_by_symbol[clean_symbol] = float(volume_values.tail(20).mean())
 
         with _daily_baseline_lock:
             _daily_baseline_cache["trading_date"] = datetime.now(IST).date().isoformat()
@@ -429,23 +446,34 @@ def fetch_all_sectors() -> Dict[str, Any]:
         except Exception:
             return None
 
-    # STEP 1 — SmartAPI FULL quotes (replaces NSE website scraping).
+    # STEP 1 — Upstox FULL quotes (primary live market data).
     # Returns per symbol: ltp, change_pct, prev_close, vwap, day_high, day_low,
     #                     total_traded_volume (lakhs), bid_ask_ratio, bid_qty, ask_qty
-    logger.info(f"Fetching SmartAPI FULL quotes for {len(clean_symbols)} symbols...")
-    nse_full: Dict[str, Any] = {}
+    logger.info(f"Fetching Upstox FULL quotes for {len(clean_symbols)} symbols...")
+    upstox_full: Dict[str, Any] = {}
     try:
-        nse_full = get_bulk_full_quotes(clean_symbols)
-        logger.info(f"SmartAPI quotes received for {len(nse_full)}/{len(clean_symbols)} symbols.")
+        upstox_full = get_upstox_bulk_full_quotes(clean_symbols)
+        logger.info(f"Upstox quotes received for {len(upstox_full)}/{len(clean_symbols)} symbols.")
     except Exception as e:
-        logger.warning(f"SmartAPI full quote fetch failed: {e}")
+        logger.warning(f"Upstox full quote fetch failed: {e}")
+
+    smartapi_full: Dict[str, Any] = {}
+    missing_for_smartapi = [symbol for symbol in clean_symbols if symbol not in upstox_full]
+    if missing_for_smartapi:
+        logger.info(f"Fetching SmartAPI FULL quotes for {len(missing_for_smartapi)} missing symbols...")
+        try:
+            smartapi_full = get_bulk_full_quotes(missing_for_smartapi)
+            logger.info(f"SmartAPI quotes received for {len(smartapi_full)}/{len(missing_for_smartapi)} missing symbols.")
+        except Exception as e:
+            logger.warning(f"SmartAPI full quote fetch failed: {e}")
 
     angel_ltp: Dict[str, float] = {}
-    if not nse_full:
-        logger.info(f"Falling back to Angel LTP for {len(clean_symbols)} symbols...")
+    missing_for_ltp = [symbol for symbol in clean_symbols if symbol not in upstox_full and symbol not in smartapi_full]
+    if missing_for_ltp:
+        logger.info(f"Falling back to Angel LTP for {len(missing_for_ltp)} symbols...")
         try:
-            angel_ltp = get_bulk_ltp(clean_symbols)
-            logger.info(f"Angel LTP received for {len(angel_ltp)}/{len(clean_symbols)} symbols.")
+            angel_ltp = get_bulk_ltp(missing_for_ltp)
+            logger.info(f"Angel LTP received for {len(angel_ltp)}/{len(missing_for_ltp)} symbols.")
         except Exception as e:
             logger.warning(f"Angel LTP fetch failed: {e}")
 
@@ -463,15 +491,15 @@ def fetch_all_sectors() -> Dict[str, Any]:
     if not prev_close_by_symbol:
         logger.info("Daily baseline cache is warming up; using live quote fields and neutral volume ratios for now.")
 
-    # STEP 4 — Build sym_data: primary values from SmartAPI, volume_ratio from yfinance daily
+    # STEP 4 — Build sym_data: primary values from Upstox, then SmartAPI, then yfinance fallback
     sym_data: Dict[str, Any] = {}
     for symbol in _combined_symbols:
         try:
             clean = symbol.replace(".NS", "")
-            q = nse_full.get(clean)
+            q = upstox_full.get(clean) or smartapi_full.get(clean)
             angel_price = angel_ltp.get(clean)
 
-            # Fall back to yfinance daily if NSE quote unavailable
+            # Fall back to yfinance daily if live quote unavailable
             if not q or q.get("ltp", 0) <= 0:
                 prev_close_fb = _safe_float(prev_close_by_symbol.get(clean))
                 ltp_fb = round(float(angel_price or 0), 2)
@@ -531,10 +559,10 @@ def fetch_all_sectors() -> Dict[str, Any]:
             logger.warning(f"Skipping {symbol}: {e}")
             continue
 
-    logger.info(f"sym_data built for {len(sym_data)} symbols (SmartAPI primary, yfinance fallback).")
+    logger.info(f"sym_data built for {len(sym_data)} symbols (Upstox primary, SmartAPI backup, yfinance fallback).")
 
     # STEP 5 — quote depth data for rfactor (delivery%, bid/ask) — sourced from live quotes
-    if not nse_full:
+    if not upstox_full and not smartapi_full:
         logger.warning("Live depth data empty — using neutral placeholder values.")
 
     logger.info("R-Factor remains disabled — skipping unused 15-minute downloads and filling neutral placeholder fields.")

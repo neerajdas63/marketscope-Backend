@@ -16,6 +16,7 @@ os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import yfinance as yf
 
 from nse_fetcher import fetch_nse_index_quotes
+from upstox_client import get_intraday_history_batch, get_underlying_snapshot
 
 logger = logging.getLogger("momentum_pulse")
 
@@ -82,14 +83,30 @@ def _chunked(items: Sequence[Any], size: int) -> List[List[Any]]:
 def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame]:
     if not symbols_ns:
         return None
-    import time as _time
-    import pandas as pd
-    results = []
-    for i in range(0, len(symbols_ns), 30):
-        batch = symbols_ns[i:i+30]
+    from_date = (datetime.now(IST).date() - pd.Timedelta(days=30)).isoformat()
+    to_date = datetime.now(IST).date().isoformat()
+
+    def _collect_frames(raw: Optional[pd.DataFrame], requested_symbols: Sequence[str]) -> Dict[str, pd.DataFrame]:
+        frames: Dict[str, pd.DataFrame] = {}
+        for requested_symbol in requested_symbols:
+            frame = _get_sym_df(raw, requested_symbol)
+            if frame is not None and not frame.empty:
+                frames[requested_symbol] = frame
+        return frames
+
+    assembled_frames: Dict[str, pd.DataFrame] = {}
+
+    try:
+        upstox_raw = get_intraday_history_batch(symbols_ns, from_date=from_date, to_date=to_date, interval_minutes=5)
+        assembled_frames.update(_collect_frames(upstox_raw, symbols_ns))
+    except Exception as exc:
+        logger.warning("Momentum Pulse Upstox historical fetch failed for batch %s: %s", list(symbols_ns), exc)
+
+    missing_symbols = [symbol for symbol in symbols_ns if symbol not in assembled_frames]
+    if missing_symbols:
         try:
             raw = yf.download(
-                tickers=" ".join(batch),
+                tickers=" ".join(missing_symbols),
                 period="35d",
                 interval="5m",
                 auto_adjust=False,
@@ -98,14 +115,13 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
                 threads=False,
                 timeout=20,
             )
-            if raw is not None and not raw.empty:
-                results.append(raw)
+            assembled_frames.update(_collect_frames(raw, missing_symbols))
         except Exception as exc:
-            logger.warning(f"Momentum Pulse batch download failed for {batch}: {exc}")
-        _time.sleep(2)
-    if results:
-        return pd.concat(results, axis=1)
-    return None
+            logger.warning(f"Momentum Pulse yfinance fallback failed for {missing_symbols}: {exc}")
+
+    if not assembled_frames:
+        return None
+    return pd.concat(assembled_frames, axis=1)
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -612,6 +628,15 @@ def _build_warning_flags(
 
 
 def _nifty_change_from_sources(raw: Optional[pd.DataFrame]) -> float:
+    try:
+        snapshot = get_underlying_snapshot("NIFTY")
+        last_price = _safe_float(snapshot.get("last_price"))
+        prev_close = _safe_float(snapshot.get("prev_close"))
+        if last_price > 0 and prev_close > 0:
+            return round(((last_price - prev_close) / prev_close) * 100.0, 2)
+    except Exception as exc:
+        logger.warning("Momentum Pulse Upstox Nifty snapshot failed, using fallback: %s", exc)
+
     try:
         quotes = fetch_nse_index_quotes()
         for key in ("NIFTY 50", "NIFTY50", "NIFTY 50 PR 2X LEV", "NIFTY"):

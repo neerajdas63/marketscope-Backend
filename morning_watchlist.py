@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 
+from upstox_client import get_daily_history_batch, get_intraday_history_batch
+
 logger = logging.getLogger("morning_watchlist")
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -16,6 +18,39 @@ ORB_MINUTES: List[Tuple[int, int]] = [(9, 15), (9, 20), (9, 25)]
 # Day has ~375 trading minutes; 5-min candles = 75 candles.
 # First 3 candles (15 min) ≈ 1/25 of the day → avg_15min_vol ≈ avg_daily_vol / 25
 _AVG_CANDLES_PER_DAY = 25.0
+
+
+def _extract_symbol_frame(raw: Any, symbol: str):
+    try:
+        import pandas as pd
+
+        if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            level0 = raw.columns.get_level_values(0)
+            level1 = raw.columns.get_level_values(1)
+            if symbol in level0:
+                df = raw[symbol]
+            elif symbol in level1:
+                df = raw.xs(symbol, axis=1, level=1)
+            else:
+                return None
+        else:
+            df = raw
+        return df if df is not None and not df.empty else None
+    except Exception:
+        return None
+
+
+def _normalize_intraday_index(df):
+    if df is None or df.empty:
+        return df
+    try:
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    except Exception:
+        pass
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -80,45 +115,50 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
 
     top_sectors    = [name for name, _ in top_sector_ranks]
     sector_rank_map = {name: rank for name, rank in top_sector_ranks}
+    sector_symbols_map = {
+        sector_name: [s if s.endswith(".NS") else s + ".NS" for s in SECTORS.get(sector_name, [])]
+        for sector_name in top_sectors
+    }
+    all_symbols_ns = list({symbol for symbols in sector_symbols_map.values() for symbol in symbols})
 
     logger.info("Building watchlist for %s | top sectors: %s", date, top_sectors)
 
     watchlist: List[Dict[str, Any]] = []
 
-    for sector_name in top_sectors:
-        symbols    = list(SECTORS.get(sector_name, []))
-        symbols_ns = [s if s.endswith(".NS") else s + ".NS" for s in symbols]
-        if not symbols_ns:
-            continue
+    daily_raw = None
+    try:
+        daily_raw = get_daily_history_batch(all_symbols_ns, from_date=daily_start, to_date=date)
+    except Exception as exc:
+        logger.warning("Morning watchlist Upstox daily fetch failed: %s", exc)
 
-        tickers_str = " ".join(symbols_ns)
-
-        # ── Daily data: prev_day close/high/low + avg volume ──────────────
-        daily_raw: Optional[Any] = None
+    daily_fallback = None
+    missing_daily = [symbol for symbol in all_symbols_ns if _extract_symbol_frame(daily_raw, symbol) is None]
+    if missing_daily:
         try:
-            daily_raw = yf.download(
-                tickers=tickers_str,
+            daily_fallback = yf.download(
+                tickers=" ".join(missing_daily),
                 start=daily_start,
-                end=date,           # exclusive → last row = prev trading day
+                end=date,
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
                 threads=True,
             )
-            if daily_raw is not None and not daily_raw.empty:
-                if daily_raw.index.tz is not None:
-                    daily_raw.index = (
-                        daily_raw.index
-                        .tz_convert("Asia/Kolkata")
-                        .tz_localize(None)
-                    )
         except Exception as exc:
-            logger.warning("Daily download failed for %s: %s", sector_name, exc)
+            logger.warning("Morning watchlist daily yfinance fallback failed: %s", exc)
 
-        # ── Intraday 5-min data ───────────────────────────────────────────
+    intra_raw = None
+    try:
+        intra_raw = get_intraday_history_batch(all_symbols_ns, from_date=date, to_date=date, interval_minutes=5)
+    except Exception as exc:
+        logger.warning("Morning watchlist Upstox intraday fetch failed: %s", exc)
+
+    intra_fallback = None
+    missing_intra = [symbol for symbol in all_symbols_ns if _extract_symbol_frame(intra_raw, symbol) is None]
+    if missing_intra:
         try:
-            intra_raw = yf.download(
-                tickers=tickers_str,
+            intra_fallback = yf.download(
+                tickers=" ".join(missing_intra),
                 start=date,
                 end=next_day,
                 interval="5m",
@@ -127,25 +167,11 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
                 threads=True,
             )
         except Exception as exc:
-            logger.warning("Intraday download failed for %s: %s", sector_name, exc)
-            continue
+            logger.warning("Morning watchlist intraday yfinance fallback failed: %s", exc)
 
-        if intra_raw is None or intra_raw.empty:
-            logger.warning("Empty intraday for %s", sector_name)
-            continue
-
-        # UTC → naive IST
-        if intra_raw.index.tz is not None:
-            intra_raw.index = (
-                intra_raw.index
-                .tz_convert("Asia/Kolkata")
-                .tz_localize(None)
-            )
-
-        # Keep only target date rows
-        intra_raw = intra_raw[intra_raw.index.date == target_date_obj]
-        if intra_raw.empty:
-            logger.warning("No IST intraday rows for %s on %s", sector_name, date)
+    for sector_name in top_sectors:
+        symbols_ns = sector_symbols_map.get(sector_name, [])
+        if not symbols_ns:
             continue
 
         # ── Per-symbol processing ─────────────────────────────────────────
@@ -153,15 +179,20 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
             sym_display = sym_ns.replace(".NS", "")
             try:
                 # Extract this symbol's intraday slice
-                if isinstance(intra_raw.columns, pd.MultiIndex):
-                    avail = intra_raw.columns.get_level_values(1).unique().tolist()
-                    if sym_ns not in avail:
+                intra_df = None
+                for raw in (intra_raw, intra_fallback):
+                    intra_df = _extract_symbol_frame(raw, sym_ns)
+                    if intra_df is None or intra_df.empty:
+                        intra_df = None
                         continue
-                    intra_df = intra_raw.xs(sym_ns, axis=1, level=1)
-                else:
-                    intra_df = intra_raw  # single-ticker fallback
+                    intra_df = _normalize_intraday_index(intra_df.copy())
+                    intra_df = intra_df[intra_df.index.date == target_date_obj]
+                    if intra_df.empty:
+                        intra_df = None
+                        continue
+                    break
 
-                if intra_df.empty:
+                if intra_df is None or intra_df.empty:
                     continue
 
                 # ── ORB: first three 5-min candles (9:15, 9:20, 9:25) ────
@@ -185,26 +216,21 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
                 prev_day_low  = 0.0
                 avg_15min_vol = 0.0
 
-                if daily_raw is not None and not daily_raw.empty:
+                for raw in (daily_raw, daily_fallback):
+                    daily_df = _extract_symbol_frame(raw, sym_ns)
+                    if daily_df is None or daily_df.empty:
+                        continue
                     try:
-                        if isinstance(daily_raw.columns, pd.MultiIndex):
-                            d_avail = daily_raw.columns.get_level_values(1).unique().tolist()
-                            if sym_ns in d_avail:
-                                daily_df = daily_raw.xs(sym_ns, axis=1, level=1).dropna(how="all")
-                                if not daily_df.empty:
-                                    prev_close     = round(float(daily_df["Close"].iloc[-1]), 2)
-                                    prev_day_high  = round(float(daily_df["High"].iloc[-1]), 2)
-                                    prev_day_low   = round(float(daily_df["Low"].iloc[-1]), 2)
-                                    avg_daily_vol  = float(daily_df["Volume"].mean())
-                                    avg_15min_vol  = avg_daily_vol / _AVG_CANDLES_PER_DAY
-                        else:
-                            daily_df = daily_raw.dropna(how="all")
-                            if not daily_df.empty:
-                                prev_close     = round(float(daily_df["Close"].iloc[-1]), 2)
-                                prev_day_high  = round(float(daily_df["High"].iloc[-1]), 2)
-                                prev_day_low   = round(float(daily_df["Low"].iloc[-1]), 2)
-                                avg_daily_vol  = float(daily_df["Volume"].mean())
-                                avg_15min_vol  = avg_daily_vol / _AVG_CANDLES_PER_DAY
+                        daily_df = _normalize_intraday_index(daily_df.copy()).dropna(how="all")
+                        daily_df = daily_df[daily_df.index.date < target_date_obj]
+                        if daily_df.empty:
+                            continue
+                        prev_close     = round(float(daily_df["Close"].iloc[-1]), 2)
+                        prev_day_high  = round(float(daily_df["High"].iloc[-1]), 2)
+                        prev_day_low   = round(float(daily_df["Low"].iloc[-1]), 2)
+                        avg_daily_vol  = float(daily_df["Volume"].tail(10).mean())
+                        avg_15min_vol  = avg_daily_vol / _AVG_CANDLES_PER_DAY
+                        break
                     except Exception as exc:
                         logger.warning("Daily stats error for %s: %s", sym_ns, exc)
 

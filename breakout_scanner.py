@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List
 
+from upstox_client import get_bulk_full_quotes as get_upstox_bulk_full_quotes, get_daily_history_batch
+
 logger = logging.getLogger("breakout_scanner")
 
 # ---------------------------------------------------------------------------
@@ -308,20 +310,48 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
     import os
     os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
-    import numpy as np
     from stocks import FO_STOCKS
 
     symbols_ns = [sym + ".NS" for sym in FO_STOCKS]
-    logger.info("52W scanner: downloading 1-year daily data for %d symbols…", len(symbols_ns))
+    logger.info("52W scanner: downloading 1-year daily data for %d symbols.", len(symbols_ns))
 
-    import time as _time
+    from datetime import timedelta
     import pandas as pd
-    results = []
-    for i in range(0, len(symbols_ns), 30):
-        batch = symbols_ns[i:i+30]
+
+    to_date = datetime.now().date().isoformat()
+    from_date = (datetime.now().date() - timedelta(days=380)).isoformat()
+
+    raw = None
+    try:
+        raw = get_daily_history_batch(symbols_ns, from_date=from_date, to_date=to_date)
+    except Exception as exc:
+        logger.warning("52W Upstox daily history fetch failed: %s", exc)
+
+    def _extract_symbol_frame(source: Any, symbol: str):
         try:
-            raw = yf.download(
-                tickers=" ".join(batch),
+            if source is None or not isinstance(source, pd.DataFrame) or source.empty:
+                return None
+            if isinstance(source.columns, pd.MultiIndex):
+                level0 = source.columns.get_level_values(0)
+                level1 = source.columns.get_level_values(1)
+                if symbol in level0:
+                    frame = source[symbol]
+                elif symbol in level1:
+                    frame = source.xs(symbol, axis=1, level=1)
+                else:
+                    return None
+            else:
+                frame = source
+            return frame if frame is not None and not frame.empty else None
+        except Exception:
+            return None
+
+    fallback_raw = None
+    missing_history = [symbol for symbol in symbols_ns if _extract_symbol_frame(raw, symbol) is None]
+    if missing_history:
+        try:
+            fallback_raw = yf.download(
+                tickers=" ".join(missing_history),
                 period="1y",
                 interval="1d",
                 auto_adjust=False,
@@ -330,30 +360,23 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
                 threads=True,
                 timeout=60,
             )
-            if raw is not None and not raw.empty:
-                results.append(raw)
         except Exception as exc:
-            logger.error(f"52W batch download failed for {batch}: {exc}")
-        _time.sleep(2)
-    if results:
-        raw = pd.concat(results, axis=1)
-    else:
-        return []
-    if raw is None or raw.empty:
-        return []
+            logger.error("52W yfinance fallback failed for %s: %s", missing_history, exc)
 
-    import pandas as pd
+    live_quotes: Dict[str, Dict[str, Any]] = {}
+    try:
+        live_quotes = get_upstox_bulk_full_quotes(FO_STOCKS)
+    except Exception as exc:
+        logger.warning("52W Upstox live quote fetch failed: %s", exc)
+
     results: List[Dict[str, Any]] = []
 
     for sym_ns in symbols_ns:
         clean = sym_ns.replace(".NS", "")
         try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                if sym_ns not in raw.columns.get_level_values(0):
-                    continue
-                df = raw[sym_ns]
-            else:
-                df = raw
+            df = _extract_symbol_frame(raw, sym_ns) or _extract_symbol_frame(fallback_raw, sym_ns)
+            if df is None or df.empty:
+                continue
 
             closes  = df["Close"].dropna()
             volumes = df["Volume"].dropna()
@@ -361,9 +384,11 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
             if len(closes) < 22:   # need at least 1 month of data
                 continue
 
-            # Current session
-            ltp    = float(closes.iloc[-1])
-            today_vol = float(volumes.iloc[-1]) if not volumes.empty else 0.0
+            quote = live_quotes.get(clean) or {}
+            ltp = float(quote.get("ltp") or closes.iloc[-1])
+            today_vol = float(quote.get("total_traded_volume") or 0.0) * 100_000
+            if today_vol <= 0:
+                today_vol = float(volumes.iloc[-1]) if not volumes.empty else 0.0
 
             # 52W high = max close over last 252 trading days
             w52_high = float(closes.iloc[-252:].max()) if len(closes) >= 252 else float(closes.max())

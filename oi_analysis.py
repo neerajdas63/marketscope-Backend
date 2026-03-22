@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pytz
+from upstox_client import get_nearest_option_expiry, get_option_chain as get_upstox_option_chain, get_underlying_snapshot
 _IST = pytz.timezone("Asia/Kolkata")
 
 logger = logging.getLogger("oi_analysis")
@@ -32,6 +33,173 @@ _DEFAULT_OI_SYMBOLS = [
     "BHARTIARTL", "HCLTECH", "TITAN", "MARUTI", "TATASTEEL",
     "BAJAJ-AUTO", "DRREDDY", "CIPLA", "DIVISLAB", "TECHM",
 ]
+
+
+def _build_compact_chain_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    for rec in records:
+        strike = float(rec.get("strikePrice", 0) or 0)
+        ce = rec.get("CE") or {}
+        pe = rec.get("PE") or {}
+        if strike <= 0:
+            continue
+        compact.append(
+            {
+                "strike": strike,
+                "call_oi": int(ce.get("openInterest", 0) or 0),
+                "call_prev_oi": int(ce.get("prevOpenInterest", ce.get("openInterest", 0)) or 0),
+                "put_oi": int(pe.get("openInterest", 0) or 0),
+                "put_prev_oi": int(pe.get("prevOpenInterest", pe.get("openInterest", 0)) or 0),
+            }
+        )
+    return compact
+
+
+def _build_compact_upstox_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    for row in rows:
+        strike = float(row.get("strike_price", 0) or 0)
+        if strike <= 0:
+            continue
+        call_market = (row.get("call_options") or {}).get("market_data") or {}
+        put_market = (row.get("put_options") or {}).get("market_data") or {}
+        compact.append(
+            {
+                "strike": strike,
+                "call_oi": int(call_market.get("oi", 0) or 0),
+                "call_prev_oi": int(call_market.get("prev_oi", call_market.get("oi", 0)) or 0),
+                "put_oi": int(put_market.get("oi", 0) or 0),
+                "put_prev_oi": int(put_market.get("prev_oi", put_market.get("oi", 0)) or 0),
+            }
+        )
+    return compact
+
+
+def _compute_max_pain_from_compact_records(records: List[Dict[str, Any]]) -> float:
+    strikes = sorted({float(rec.get("strike", 0) or 0) for rec in records if float(rec.get("strike", 0) or 0) > 0})
+    if not strikes:
+        return 0.0
+
+    min_pain = float("inf")
+    max_pain_strike = strikes[0]
+    for test_strike in strikes:
+        total_loss = 0.0
+        for rec in records:
+            strike = float(rec.get("strike", 0) or 0)
+            if strike <= 0:
+                continue
+            total_loss += max(0.0, test_strike - strike) * int(rec.get("call_oi", 0) or 0)
+            total_loss += max(0.0, strike - test_strike) * int(rec.get("put_oi", 0) or 0)
+        if total_loss < min_pain:
+            min_pain = total_loss
+            max_pain_strike = test_strike
+
+    return float(max_pain_strike)
+
+
+def _compute_oi_analysis_from_compact_records(
+    symbol: str,
+    compact_records: List[Dict[str, Any]],
+    underlying_price: float,
+    price_change: float,
+    oi_source: str,
+) -> Dict[str, Any]:
+    if not compact_records:
+        return {}
+
+    total_call_oi = 0
+    total_put_oi = 0
+    total_call_oi_prev = 0
+    total_put_oi_prev = 0
+    call_oi_by_strike: Dict[float, int] = {}
+    put_oi_by_strike: Dict[float, int] = {}
+
+    for rec in compact_records:
+        strike = float(rec.get("strike", 0) or 0)
+        call_oi = int(rec.get("call_oi", 0) or 0)
+        call_prev_oi = int(rec.get("call_prev_oi", call_oi) or 0)
+        put_oi = int(rec.get("put_oi", 0) or 0)
+        put_prev_oi = int(rec.get("put_prev_oi", put_oi) or 0)
+
+        total_call_oi += call_oi
+        total_put_oi += put_oi
+        total_call_oi_prev += call_prev_oi
+        total_put_oi_prev += put_prev_oi
+
+        if strike > 0:
+            call_oi_by_strike[strike] = call_oi_by_strike.get(strike, 0) + call_oi
+            put_oi_by_strike[strike] = put_oi_by_strike.get(strike, 0) + put_oi
+
+    total_oi_now = total_call_oi + total_put_oi
+    total_oi_prev = total_call_oi_prev + total_put_oi_prev
+    oi_change_pct = round(((total_oi_now - total_oi_prev) / total_oi_prev) * 100, 2) if total_oi_prev > 0 else 0.0
+
+    pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0.0
+    if pcr > 1.2:
+        pcr_signal = "OVERSOLD"
+    elif pcr < 0.7:
+        pcr_signal = "OVERBOUGHT"
+    else:
+        pcr_signal = "NEUTRAL"
+
+    oi_increased = total_oi_now > total_oi_prev
+    price_up = price_change > 0
+    if price_up and oi_increased:
+        oi_signal = "LONG_BUILDUP"
+    elif not price_up and oi_increased:
+        oi_signal = "SHORT_BUILDUP"
+    elif price_up and not oi_increased:
+        oi_signal = "SHORT_COVERING"
+    else:
+        oi_signal = "LONG_UNWINDING"
+
+    support_strikes = sorted(put_oi_by_strike, key=lambda strike: put_oi_by_strike[strike], reverse=True)[:3]
+    resistance_strikes = sorted(call_oi_by_strike, key=lambda strike: call_oi_by_strike[strike], reverse=True)[:3]
+    max_pain = _compute_max_pain_from_compact_records(compact_records)
+
+    return {
+        "symbol": symbol.upper(),
+        "price": round(underlying_price, 2),
+        "current_price": round(underlying_price, 2),
+        "oi_signal": oi_signal,
+        "oi_change_pct": oi_change_pct,
+        "total_call_oi": total_call_oi,
+        "total_put_oi": total_put_oi,
+        "pcr": pcr,
+        "pcr_signal": pcr_signal,
+        "max_pain": max_pain,
+        "support_strikes": sorted(support_strikes),
+        "resistance_strikes": sorted(resistance_strikes),
+        "oi_source": oi_source,
+    }
+
+
+def _get_upstox_oi_analysis(symbol: str) -> Dict[str, Any]:
+    payload = get_upstox_option_chain(symbol)
+    rows = list(payload.get("data") or [])
+    if not rows:
+        return {}
+
+    compact_records = _build_compact_upstox_records(rows)
+    if not compact_records:
+        return {}
+
+    underlying_price = float((rows[0] or {}).get("underlying_spot_price", 0) or 0)
+    snapshot = get_underlying_snapshot(symbol)
+    price_change = float(snapshot.get("net_change", 0) or 0)
+    if underlying_price <= 0:
+        underlying_price = float(snapshot.get("last_price", 0) or 0)
+
+    result = _compute_oi_analysis_from_compact_records(
+        symbol=symbol,
+        compact_records=compact_records,
+        underlying_price=underlying_price,
+        price_change=price_change,
+        oi_source="upstox_option_chain",
+    )
+    if result:
+        result["expiry_date"] = str(payload.get("expiry_date") or get_nearest_option_expiry(symbol) or "")
+    return result
 
 
 def fetch_option_chain(symbol: str) -> Optional[Dict]:
@@ -104,6 +272,50 @@ def _compute_max_pain(records: List[Dict]) -> float:
     return float(max_pain_strike)
 
 
+def _get_nse_oi_analysis(symbol: str) -> Dict[str, Any]:
+    from nse_fetcher import _get_session
+
+    raw = fetch_option_chain(symbol)
+    if not raw:
+        return {}
+
+    records_wrapper = raw.get("records", {})
+    records: List[Dict] = records_wrapper.get("data", [])
+    underlying_price = float(records_wrapper.get("underlyingValue", 0) or 0)
+    if not records:
+        logger.warning("Empty option chain records for %s", symbol)
+        return {}
+
+    compact_records = _build_compact_chain_records(records)
+    price_change = 0.0
+    try:
+        sym_upper = symbol.upper()
+        if sym_upper not in _INDEX_SYMBOLS:
+            sess = _get_session()
+            r = sess.get(
+                "https://www.nseindia.com/api/quote-equity",
+                params={"symbol": sym_upper},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                price_change = float(r.json().get("priceInfo", {}).get("change", 0) or 0)
+        else:
+            snapshot = get_underlying_snapshot(symbol)
+            price_change = float(snapshot.get("net_change", 0) or 0)
+            if underlying_price <= 0:
+                underlying_price = float(snapshot.get("last_price", 0) or 0)
+    except Exception:
+        pass
+
+    return _compute_oi_analysis_from_compact_records(
+        symbol=symbol,
+        compact_records=compact_records,
+        underlying_price=underlying_price,
+        price_change=price_change,
+        oi_source="nse_option_chain",
+    )
+
+
 def get_oi_analysis(symbol: str) -> Dict[str, Any]:
     """
     Return full OI analysis dict for a given F&O stock or index symbol.
@@ -114,121 +326,12 @@ def get_oi_analysis(symbol: str) -> Dict[str, Any]:
         total_call_oi, total_put_oi, pcr, pcr_signal,
         max_pain, support_strikes, resistance_strikes
     """
-    from nse_fetcher import _get_session
     try:
-        raw = fetch_option_chain(symbol)
-        if not raw:
-            return {}
+        upstox_result = _get_upstox_oi_analysis(symbol)
+        if upstox_result:
+            return upstox_result
 
-        records_wrapper = raw.get("records", {})
-        records: List[Dict] = records_wrapper.get("data", [])
-        underlying_price = float(records_wrapper.get("underlyingValue", 0) or 0)
-
-        if not records:
-            logger.warning("Empty option chain records for %s", symbol)
-            return {}
-
-        total_call_oi = 0
-        total_put_oi = 0
-        total_call_oi_prev = 0
-        total_put_oi_prev = 0
-        call_oi_by_strike: Dict[float, int] = {}
-        put_oi_by_strike:  Dict[float, int] = {}
-
-        for rec in records:
-            ce = rec.get("CE") or {}
-            pe = rec.get("PE") or {}
-            strike = float(rec.get("strikePrice", 0) or 0)
-
-            if ce:
-                oi      = int(ce.get("openInterest", 0) or 0)
-                oi_prev = int(ce.get("prevOpenInterest", oi) or oi)
-                total_call_oi      += oi
-                total_call_oi_prev += oi_prev
-                if strike > 0:
-                    call_oi_by_strike[strike] = call_oi_by_strike.get(strike, 0) + oi
-
-            if pe:
-                oi      = int(pe.get("openInterest", 0) or 0)
-                oi_prev = int(pe.get("prevOpenInterest", oi) or oi)
-                total_put_oi      += oi
-                total_put_oi_prev += oi_prev
-                if strike > 0:
-                    put_oi_by_strike[strike] = put_oi_by_strike.get(strike, 0) + oi
-
-        total_oi_now  = total_call_oi + total_put_oi
-        total_oi_prev = total_call_oi_prev + total_put_oi_prev
-        oi_change_pct = round(
-            (total_oi_now - total_oi_prev) / total_oi_prev * 100, 2
-        ) if total_oi_prev > 0 else 0.0
-
-        # PCR
-        pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0.0
-        if pcr > 1.2:
-            pcr_signal = "OVERSOLD"
-        elif pcr < 0.7:
-            pcr_signal = "OVERBOUGHT"
-        else:
-            pcr_signal = "NEUTRAL"
-
-        # Price direction for OI signal — use underlying_price vs prev close
-        price_change = 0.0
-        try:
-            sym_upper = symbol.upper()
-            if sym_upper not in _INDEX_SYMBOLS:
-                sess = _get_session()
-                r = sess.get(
-                    "https://www.nseindia.com/api/quote-equity",
-                    params={"symbol": sym_upper},
-                    timeout=5,
-                )
-                if r.status_code == 200:
-                    price_change = float(
-                        r.json().get("priceInfo", {}).get("change", 0) or 0
-                    )
-            else:
-                # For indices, derive from underlyingValue vs prev OC recorded value
-                prev_close = float(records_wrapper.get("strikePrices", [0])[0] or 0)
-                price_change = underlying_price - prev_close
-        except Exception:
-            pass
-
-        oi_increased = total_oi_now > total_oi_prev
-        price_up     = price_change > 0
-
-        if price_up and oi_increased:
-            oi_signal = "LONG_BUILDUP"
-        elif not price_up and oi_increased:
-            oi_signal = "SHORT_BUILDUP"
-        elif price_up and not oi_increased:
-            oi_signal = "SHORT_COVERING"
-        else:
-            oi_signal = "LONG_UNWINDING"
-
-        # Top 3 support (put OI) and resistance (call OI) strikes
-        support_strikes = sorted(
-            put_oi_by_strike, key=lambda s: put_oi_by_strike[s], reverse=True
-        )[:3]
-        resistance_strikes = sorted(
-            call_oi_by_strike, key=lambda s: call_oi_by_strike[s], reverse=True
-        )[:3]
-
-        max_pain = _compute_max_pain(records)
-
-        return {
-            "symbol":              symbol.upper(),
-            "price":               round(underlying_price, 2),
-            "current_price":       round(underlying_price, 2),   # alias for frontend compat
-            "oi_signal":           oi_signal,
-            "oi_change_pct":       oi_change_pct,
-            "total_call_oi":       total_call_oi,
-            "total_put_oi":        total_put_oi,
-            "pcr":                 pcr,
-            "pcr_signal":          pcr_signal,
-            "max_pain":            max_pain,
-            "support_strikes":     sorted(support_strikes),
-            "resistance_strikes":  sorted(resistance_strikes),
-        }
+        return _get_nse_oi_analysis(symbol)
 
     except Exception as e:
         logger.error("get_oi_analysis failed for %s: %s", symbol, e, exc_info=True)
