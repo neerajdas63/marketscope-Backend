@@ -495,27 +495,45 @@ def _detect_fresh_entries(items: Sequence[Dict[str, Any]], source_key: str) -> L
 
 def _build_fresh_tab(items: Sequence[Dict[str, Any]], source_key: str, limit: int) -> Dict[str, Any]:
     fresh_symbols = set(_detect_fresh_entries(items, source_key))
+    selection_mode = "top_zone_entry"
     fresh_candidates = [
         item for item in items
         if str(item.get("symbol") or "") in fresh_symbols
         and (_safe_float(item.get("score_change_10m")) > 0 or bool(item.get("improving_now")))
     ]
     if not fresh_candidates:
+        selection_mode = "trend_improvers"
         fresh_candidates = [
             item for item in items
-            if (_safe_float(item.get("score_change_10m")) >= 3.0 or bool(item.get("improving_now")))
+            if str(item.get("direction") or "") in {"LONG", "SHORT"}
+            and str(item.get("pulse_trend_label") or "") == "Rising"
+            and (
+                _safe_float(item.get("score_change_10m")) >= 1.0
+                or bool(item.get("improving_now"))
+            )
+        ]
+    if not fresh_candidates:
+        selection_mode = "active_directional_strength"
+        fresh_candidates = [
+            item for item in items
+            if str(item.get("direction") or "") in {"LONG", "SHORT"}
+            and str(item.get("behavior_state") or "") in {"EARLY", "ACTIVE"}
+            and _safe_float(item.get("momentum_pulse_score")) >= 58.0
+            and _safe_float(item.get("pulse_trend_strength")) >= 28.0
         ]
     fresh_candidates.sort(
         key=lambda item: (
             _safe_float(item.get("score_change_10m")),
             _safe_float(item.get("pulse_trend_strength")),
             _safe_float(item.get("momentum_pulse_score")),
+            _safe_float(item.get("direction_confidence")),
         ),
         reverse=True,
     )
     return {
         "tab": "fresh",
         "title": "Fresh Movers",
+        "selection_mode": selection_mode,
         "longs": _slice([item for item in fresh_candidates if str(item.get("direction")) == "LONG"], limit),
         "shorts": _slice([item for item in fresh_candidates if str(item.get("direction")) == "SHORT"], limit),
         "stocks": _slice(fresh_candidates, limit),
