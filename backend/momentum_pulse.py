@@ -24,7 +24,7 @@ IST = pytz.timezone("Asia/Kolkata")
 LOOKBACK_SESSIONS = 20
 MAX_HISTORY_POINTS = 24
 REFRESH_COOLDOWN_SECONDS = 240
-MIN_SESSION_BARS = 6
+MIN_SESSION_BARS = 1
 
 _pulse_cache: Dict[str, Any] = {
     "source_key": "",
@@ -686,6 +686,7 @@ def _evaluate_symbol(
     current_session_date, session_df = sessions[-1]
     if len(session_df) < MIN_SESSION_BARS:
         return None
+    session_bar_count = len(session_df)
 
     historical_sessions = sessions[:-1][-LOOKBACK_SESSIONS:]
     if not historical_sessions:
@@ -779,6 +780,11 @@ def _evaluate_symbol(
     score_adjustment, confidence_multiplier = _time_adjustment(score_time_bucket, preview_label)
     long_score = round(max(0.0, min(100.0, long_score + score_adjustment)), 1)
     short_score = round(max(0.0, min(100.0, short_score + score_adjustment)), 1)
+
+    if session_bar_count <= 2:
+        warmup_penalty = 4.0 if session_bar_count == 1 else 2.0
+        long_score = round(max(0.0, long_score - warmup_penalty), 1)
+        short_score = round(max(0.0, short_score - warmup_penalty), 1)
 
     direction, direction_confidence = infer_direction(long_score, short_score)
     direction_confidence = round(max(0.0, min(100.0, direction_confidence * confidence_multiplier)), 1)
@@ -884,6 +890,7 @@ def _evaluate_symbol(
         "improving_now": pulse_trend_label == "Rising" and _safe_float(committed_trend.get("score_change_10m")) > 0,
         "long_score": round(long_score, 1),
         "short_score": round(short_score, 1),
+        "session_bar_count": session_bar_count,
         "latest_bar_time": latest_ts.strftime("%H:%M"),
     }
 

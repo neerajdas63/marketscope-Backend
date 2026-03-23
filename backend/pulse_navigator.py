@@ -10,12 +10,21 @@ from stocks import SECTORS
 IST = pytz.timezone("Asia/Kolkata")
 DEFAULT_FETCH_LIMIT = 120
 TOP_ZONE_RANK = 15
+LEADER_REPLACE_MARGIN = 4.0
+LEADER_CONFIRMATION_STEPS = 2
+SECTOR_TAB_LIMIT = 5
+SECTOR_AGGREGATE_DEPTH = 3
 
 _navigator_lock = threading.Lock()
 _navigator_state: Dict[str, Any] = {
     "source_key": "",
     "current_ranks": {},
     "fresh_symbols": [],
+    "leader_session_key": "",
+    "leaders": {
+        "LONG": {"symbol": "", "challenger": "", "challenger_steps": 0},
+        "SHORT": {"symbol": "", "challenger": "", "challenger_steps": 0},
+    },
 }
 
 _ACTIONABILITY_PRIORITY = {
@@ -23,6 +32,13 @@ _ACTIONABILITY_PRIORITY = {
     "needs_pullback": 2,
     "extended": 1,
     "risky_spike": 0,
+}
+
+_BEHAVIOR_PRIORITY = {
+    "EARLY": 4,
+    "ACTIVE": 3,
+    "LATE": 2,
+    "EXTENDED": 0,
 }
 
 _PRESET_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -90,6 +106,230 @@ def _rank_key(item: Dict[str, Any]) -> tuple:
         _safe_float(item.get("direction_confidence")),
         abs(_safe_float(item.get("relative_strength"))),
     )
+
+
+def _leader_session_key() -> str:
+    return datetime.now(IST).date().isoformat()
+
+
+def _avg_score_history(item: Dict[str, Any]) -> float:
+    history = [_safe_float(value) for value in item.get("score_history") or []]
+    if not history:
+        return _safe_float(item.get("momentum_pulse_score"))
+    return round(sum(history) / len(history), 1)
+
+
+def _directional_consistency_score(item: Dict[str, Any]) -> float:
+    direction = str(item.get("direction") or "NEUTRAL")
+    if direction == "LONG":
+        return _safe_float(item.get("long_directional_consistency_score"))
+    if direction == "SHORT":
+        return _safe_float(item.get("short_directional_consistency_score"))
+    return 0.0
+
+
+def _directional_vwap_score(item: Dict[str, Any]) -> float:
+    direction = str(item.get("direction") or "NEUTRAL")
+    if direction == "LONG":
+        return _safe_float(item.get("long_vwap_alignment_score"))
+    if direction == "SHORT":
+        return _safe_float(item.get("short_vwap_alignment_score"))
+    return 0.0
+
+
+def _session_leader_score(item: Dict[str, Any]) -> float:
+    direction = str(item.get("direction") or "NEUTRAL")
+    if direction not in {"LONG", "SHORT"}:
+        return 0.0
+
+    current_score = _safe_float(item.get("momentum_pulse_score"))
+    average_score = _avg_score_history(item)
+    consistency_score = _directional_consistency_score(item)
+    vwap_score = _directional_vwap_score(item)
+    direction_confidence = _safe_float(item.get("direction_confidence"))
+    pulse_trend_strength = _safe_float(item.get("pulse_trend_strength"))
+    relative_strength = _safe_float(item.get("relative_strength"))
+    aligned_relative_strength = relative_strength if direction == "LONG" else -relative_strength
+    relative_strength_score = max(0.0, min(100.0, aligned_relative_strength * 28.0 + 50.0))
+    behavior_bonus = _BEHAVIOR_PRIORITY.get(str(item.get("behavior_state") or ""), 0) * 2.5
+    warning_penalty = int(item.get("warning_count", 0) or 0) * 3.5
+    extension_penalty = 7.0 if bool(item.get("is_extended")) else 0.0
+    spike_penalty = 10.0 if "one_bar_spike" in {str(flag) for flag in item.get("warning_flags") or []} else 0.0
+
+    score = (
+        current_score * 0.28
+        + average_score * 0.24
+        + direction_confidence * 0.14
+        + relative_strength_score * 0.16
+        + consistency_score * 0.10
+        + vwap_score * 0.05
+        + pulse_trend_strength * 0.03
+        + behavior_bonus
+        - warning_penalty
+        - extension_penalty
+        - spike_penalty
+    )
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _leader_rank_key(item: Dict[str, Any]) -> tuple:
+    direction = str(item.get("direction") or "NEUTRAL")
+    relative_strength = _safe_float(item.get("relative_strength"))
+    aligned_relative_strength = relative_strength if direction == "LONG" else -relative_strength
+    return (
+        _safe_float(item.get("session_leader_score")),
+        _avg_score_history(item),
+        aligned_relative_strength,
+        _safe_float(item.get("direction_confidence")),
+        -int(item.get("warning_count", 0) or 0),
+    )
+
+
+def _aligned_relative_strength(item: Dict[str, Any]) -> float:
+    direction = str(item.get("direction") or "NEUTRAL")
+    relative_strength = _safe_float(item.get("relative_strength"))
+    if direction == "LONG":
+        return relative_strength
+    if direction == "SHORT":
+        return -relative_strength
+    return 0.0
+
+
+def _stock_opportunity_score(item: Dict[str, Any]) -> float:
+    actionability_label = str(item.get("actionability_label") or "needs_pullback")
+    actionability_bonus = {
+        "clean_setup": 8.0,
+        "needs_pullback": 3.0,
+        "extended": -4.0,
+        "risky_spike": -12.0,
+    }.get(actionability_label, 0.0)
+    behavior_bonus = _BEHAVIOR_PRIORITY.get(str(item.get("behavior_state") or ""), 0) * 1.5
+    aligned_relative_strength = _aligned_relative_strength(item)
+    relative_strength_score = max(0.0, min(100.0, aligned_relative_strength * 24.0 + 50.0))
+    warning_penalty = int(item.get("warning_count", 0) or 0) * 2.5
+    extension_penalty = 4.0 if bool(item.get("is_extended")) else 0.0
+
+    score = (
+        _safe_float(item.get("momentum_pulse_score")) * 0.52
+        + _safe_float(item.get("pulse_trend_strength")) * 0.16
+        + _safe_float(item.get("direction_confidence")) * 0.14
+        + relative_strength_score * 0.10
+        + behavior_bonus
+        + actionability_bonus
+        - warning_penalty
+        - extension_penalty
+    )
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _sector_stock_rank_key(item: Dict[str, Any]) -> tuple:
+    return (
+        _safe_float(item.get("sector_opportunity_score")),
+        _leader_rank_key(item),
+    )
+
+
+def _leader_reason(item: Dict[str, Any]) -> str:
+    direction = str(item.get("direction") or "NEUTRAL")
+    consistency_score = _directional_consistency_score(item)
+    relative_strength = _safe_float(item.get("relative_strength"))
+    distance_from_vwap_pct = _safe_float(item.get("distance_from_vwap_pct"))
+
+    parts: List[str] = []
+    if direction == "LONG" and relative_strength > 0.5:
+        parts.append(f"holding {relative_strength:.2f}% RS vs Nifty")
+    elif direction == "SHORT" and relative_strength < -0.5:
+        parts.append(f"leading downside by {abs(relative_strength):.2f}% vs Nifty")
+
+    if consistency_score >= 65.0:
+        parts.append("trend has stayed consistent through the session")
+    if abs(distance_from_vwap_pct) <= 0.9:
+        if direction == "LONG":
+            parts.append("still holding cleanly around VWAP")
+        elif direction == "SHORT":
+            parts.append("still respecting pressure around VWAP")
+    if str(item.get("behavior_state") or "") in {"EARLY", "ACTIVE"}:
+        parts.append("leadership is still active")
+
+    if not parts:
+        return "session leader based on sustained score, relative strength, and trend quality"
+    return "; ".join(parts[:3])
+
+
+def _fresh_reason(item: Dict[str, Any]) -> str:
+    score_change_10m = _safe_float(item.get("score_change_10m"))
+    pulse_trend_strength = _safe_float(item.get("pulse_trend_strength"))
+    direction = str(item.get("direction") or "NEUTRAL")
+    bias_text = "bullish" if direction == "LONG" else "bearish" if direction == "SHORT" else "directional"
+    return (
+        f"fresh {bias_text} improvement with {score_change_10m:.1f} score gain in 10m "
+        f"and trend strength {pulse_trend_strength:.1f}"
+    )
+
+
+def _select_stable_session_leader(items: Sequence[Dict[str, Any]], direction: str) -> Dict[str, Any] | None:
+    candidates = [
+        item for item in items
+        if str(item.get("direction")) == direction
+        and str(item.get("actionability_label")) != "risky_spike"
+        and _safe_float(item.get("session_leader_score")) >= 50.0
+    ]
+    if not candidates:
+        return None
+
+    candidates.sort(key=_leader_rank_key, reverse=True)
+    preferred = candidates[0]
+    session_key = _leader_session_key()
+
+    with _navigator_lock:
+        if str(_navigator_state.get("leader_session_key") or "") != session_key:
+            _navigator_state["leader_session_key"] = session_key
+            _navigator_state["leaders"] = {
+                "LONG": {"symbol": "", "challenger": "", "challenger_steps": 0},
+                "SHORT": {"symbol": "", "challenger": "", "challenger_steps": 0},
+            }
+
+        leader_state = dict((_navigator_state.get("leaders") or {}).get(direction) or {})
+        incumbent_symbol = str(leader_state.get("symbol") or "")
+        incumbent = next((item for item in candidates if str(item.get("symbol") or "") == incumbent_symbol), None)
+
+        if incumbent is None:
+            _navigator_state["leaders"][direction] = {
+                "symbol": str(preferred.get("symbol") or ""),
+                "challenger": "",
+                "challenger_steps": 0,
+            }
+            return preferred
+
+        incumbent_score = _safe_float(incumbent.get("session_leader_score"))
+        preferred_score = _safe_float(preferred.get("session_leader_score"))
+        if str(preferred.get("symbol") or "") == incumbent_symbol or preferred_score < incumbent_score + LEADER_REPLACE_MARGIN:
+            _navigator_state["leaders"][direction] = {
+                "symbol": incumbent_symbol,
+                "challenger": "",
+                "challenger_steps": 0,
+            }
+            return incumbent
+
+        challenger_symbol = str(preferred.get("symbol") or "")
+        previous_challenger = str(leader_state.get("challenger") or "")
+        previous_steps = int(leader_state.get("challenger_steps", 0) or 0)
+        challenger_steps = previous_steps + 1 if challenger_symbol == previous_challenger else 1
+
+        if challenger_steps >= LEADER_CONFIRMATION_STEPS:
+            _navigator_state["leaders"][direction] = {
+                "symbol": challenger_symbol,
+                "challenger": "",
+                "challenger_steps": 0,
+            }
+            return preferred
+
+        _navigator_state["leaders"][direction] = {
+            "symbol": incumbent_symbol,
+            "challenger": challenger_symbol,
+            "challenger_steps": challenger_steps,
+        }
+        return incumbent
 
 
 def _market_mode(items: Sequence[Dict[str, Any]]) -> str:
@@ -167,6 +407,10 @@ def _decorate_item(item: Dict[str, Any]) -> Dict[str, Any]:
     enriched["warning_count"] = len(warning_flags)
     enriched["reasons"] = _build_reasons(enriched)
     enriched["actionability_label"] = _actionability_label(enriched)
+    enriched["session_leader_score"] = _session_leader_score(enriched)
+    enriched["sector_aligned_relative_strength"] = round(_aligned_relative_strength(enriched), 2)
+    enriched["sector_opportunity_score"] = _stock_opportunity_score(enriched)
+    enriched["leader_reason"] = _leader_reason(enriched)
     enriched["ui_tags"] = [
         str(enriched.get("direction") or "NEUTRAL"),
         str(enriched.get("tier") or "veryweak"),
@@ -272,7 +516,22 @@ def _build_fresh_tab(items: Sequence[Dict[str, Any]], source_key: str, limit: in
     return {
         "tab": "fresh",
         "title": "Fresh Movers",
+        "longs": _slice([item for item in fresh_candidates if str(item.get("direction")) == "LONG"], limit),
+        "shorts": _slice([item for item in fresh_candidates if str(item.get("direction")) == "SHORT"], limit),
         "stocks": _slice(fresh_candidates, limit),
+    }
+
+
+def _build_leaders_tab(items: Sequence[Dict[str, Any]], limit: int) -> Dict[str, Any]:
+    long_candidates = [item for item in items if str(item.get("direction")) == "LONG"]
+    short_candidates = [item for item in items if str(item.get("direction")) == "SHORT"]
+    long_candidates.sort(key=_leader_rank_key, reverse=True)
+    short_candidates.sort(key=_leader_rank_key, reverse=True)
+    return {
+        "tab": "leaders",
+        "title": "Session Leaders",
+        "longs": _slice(long_candidates, limit),
+        "shorts": _slice(short_candidates, limit),
     }
 
 
@@ -286,42 +545,130 @@ def _build_sector_tab(items: Sequence[Dict[str, Any]], limit: int) -> Dict[str, 
 
     sector_cards: List[Dict[str, Any]] = []
     for sector_name, sector_items in grouped.items():
-        ranked = sorted(sector_items, key=_rank_key, reverse=True)
-        weakest = sorted(sector_items, key=lambda item: _safe_float(item.get("momentum_pulse_score")))
+        direction_groups = {
+            direction_name: sorted(
+                [
+                    item for item in sector_items
+                    if str(item.get("direction") or "") == direction_name
+                    and str(item.get("actionability_label") or "") != "risky_spike"
+                ],
+                key=_sector_stock_rank_key,
+                reverse=True,
+            )
+            for direction_name in ("LONG", "SHORT")
+        }
+        direction_summaries: List[Dict[str, Any]] = []
+        for direction_name, ranked_candidates in direction_groups.items():
+            if not ranked_candidates:
+                continue
+            top_candidates = ranked_candidates[:SECTOR_AGGREGATE_DEPTH]
+            direction_summaries.append(
+                {
+                    "direction": direction_name,
+                    "ranked": ranked_candidates,
+                    "sector_score": round(
+                        sum(_safe_float(candidate.get("sector_opportunity_score")) for candidate in top_candidates) / len(top_candidates),
+                        1,
+                    ),
+                    "market_relative_score": round(
+                        sum(_safe_float(candidate.get("sector_aligned_relative_strength")) for candidate in top_candidates) / len(top_candidates),
+                        2,
+                    ),
+                }
+            )
+
+        if direction_summaries:
+            direction_summaries.sort(
+                key=lambda summary: (
+                    _safe_float(summary.get("sector_score")),
+                    _safe_float(summary.get("market_relative_score")),
+                    len(summary.get("ranked") or []),
+                ),
+                reverse=True,
+            )
+            winning_summary = direction_summaries[0]
+            ranked = list(winning_summary.get("ranked") or [])
+            sector_direction = str(winning_summary.get("direction") or "")
+            sector_score = round(_safe_float(winning_summary.get("sector_score")), 1)
+            market_relative_score = round(_safe_float(winning_summary.get("market_relative_score")), 2)
+        else:
+            ranked = sorted(sector_items, key=_sector_stock_rank_key, reverse=True)
+            if not ranked:
+                continue
+            first_item = ranked[0]
+            sector_direction = str(first_item.get("direction") or "NEUTRAL")
+            sector_score = round(_safe_float(first_item.get("sector_opportunity_score")), 1)
+            market_relative_score = round(_safe_float(first_item.get("sector_aligned_relative_strength")), 2)
+
+        weakest = sorted(sector_items, key=lambda item: _safe_float(item.get("sector_opportunity_score")))
         leader = ranked[0] if ranked else None
         challenger = ranked[1] if len(ranked) > 1 else None
         laggard = weakest[0] if weakest else None
         if leader is None:
             continue
+
+        avg_change_pct = round(
+            sum(_safe_float(entry.get("change_pct")) for entry in sector_items) / len(sector_items),
+            2,
+        ) if sector_items else 0.0
         sector_cards.append(
             {
                 "sector": sector_name,
+                "sector_direction": sector_direction,
+                "best_stock": leader,
                 "leader": leader,
                 "challenger": challenger,
                 "laggard": laggard,
-                "sector_score": round(_safe_float(leader.get("momentum_pulse_score")), 1),
+                "sector_score": sector_score,
+                "market_relative_score": market_relative_score,
+                "average_change_pct": avg_change_pct,
+                "candidate_count": len(ranked),
+                "top_stocks": _slice(ranked, 3),
             }
         )
 
-    sector_cards.sort(key=lambda item: _safe_float(item.get("sector_score")), reverse=True)
+    sector_cards.sort(
+        key=lambda item: (
+            _safe_float(item.get("sector_score")),
+            _safe_float(item.get("market_relative_score")),
+            _safe_float(item.get("average_change_pct")),
+            int(item.get("candidate_count", 0) or 0),
+        ),
+        reverse=True,
+    )
     return {
         "tab": "sectors",
         "title": "Sector Leaders",
-        "sectors": _slice(sector_cards, limit),
+        "sectors": _slice(sector_cards, min(max(limit, 0), SECTOR_TAB_LIMIT) if limit > 0 else SECTOR_TAB_LIMIT),
     }
 
 
-def _build_hero(items: Sequence[Dict[str, Any]], fresh_tab: Dict[str, Any], sector_tab: Dict[str, Any]) -> Dict[str, Any]:
-    best_long = next((item for item in items if str(item.get("direction")) == "LONG"), None)
-    best_short = next((item for item in items if str(item.get("direction")) == "SHORT"), None)
+def _build_hero(
+    items: Sequence[Dict[str, Any]],
+    fresh_tab: Dict[str, Any],
+    sector_tab: Dict[str, Any],
+    leaders_tab: Dict[str, Any],
+) -> Dict[str, Any]:
+    leader_long = _select_stable_session_leader(items, "LONG")
+    leader_short = _select_stable_session_leader(items, "SHORT")
+    fresh_long = next(iter(fresh_tab.get("longs") or []), None)
+    fresh_short = next(iter(fresh_tab.get("shorts") or []), None)
     strongest_sector = next(iter(sector_tab.get("sectors") or []), None)
     best_fresh = next(iter(fresh_tab.get("stocks") or []), None)
     return {
         "market_mode": _market_mode(items),
-        "best_long": best_long,
-        "best_short": best_short,
+        "best_long": leader_long,
+        "best_short": leader_short,
+        "leader_long": leader_long,
+        "leader_short": leader_short,
+        "fresh_long": fresh_long,
+        "fresh_short": fresh_short,
         "best_fresh": best_fresh,
         "strongest_sector": strongest_sector,
+        "leaders_overview": {
+            "long_count": len(leaders_tab.get("longs") or []),
+            "short_count": len(leaders_tab.get("shorts") or []),
+        },
     }
 
 
@@ -355,6 +702,7 @@ def get_pulse_navigator(
             "tabs": {
                 "discover": {"tab": "discover", "title": "Discover", "buckets": []},
                 "fresh": {"tab": "fresh", "title": "Fresh Movers", "stocks": []},
+                "leaders": {"tab": "leaders", "title": "Session Leaders", "longs": [], "shorts": []},
                 "sectors": {"tab": "sectors", "title": "Sector Leaders", "sectors": []},
             },
             "hero": {"market_mode": "Warming Up"},
@@ -368,8 +716,9 @@ def get_pulse_navigator(
 
     discover_tab = _build_discover_tab(filtered_items, limit)
     fresh_tab = _build_fresh_tab(filtered_items, source_key, limit)
+    leaders_tab = _build_leaders_tab(filtered_items, limit)
     sector_tab = _build_sector_tab(filtered_items, limit)
-    hero = _build_hero(filtered_items, fresh_tab, sector_tab)
+    hero = _build_hero(filtered_items, fresh_tab, sector_tab, leaders_tab)
 
     return {
         "feature": "Pulse Navigator",
@@ -382,11 +731,12 @@ def get_pulse_navigator(
         "preset": normalized_preset,
         "direction": normalized_direction,
         "available_presets": list(_PRESET_CONFIG.keys()),
-        "available_tabs": ["discover", "fresh", "sectors"],
+        "available_tabs": ["discover", "leaders", "fresh", "sectors"],
         "total_candidates": len(filtered_items),
         "hero": hero,
         "tabs": {
             "discover": discover_tab,
+            "leaders": leaders_tab,
             "fresh": fresh_tab,
             "sectors": sector_tab,
         },
@@ -409,7 +759,7 @@ def get_pulse_navigator_tab(
         limit=limit,
     )
     selected_tab = str(tab or "discover").strip().lower()
-    if selected_tab not in {"discover", "fresh", "sectors"}:
+    if selected_tab not in {"discover", "leaders", "fresh", "sectors"}:
         selected_tab = "discover"
 
     return {
