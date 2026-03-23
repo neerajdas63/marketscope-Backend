@@ -1149,9 +1149,12 @@ def trade_guardian_monitor_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/trade-guardian/test-telegram", summary="Send Trade Guardian Telegram test", tags=["Trade Guardian"])
-def trade_guardian_test_telegram_endpoint(payload: TradeGuardianTestAlertRequest, request: Request) -> Dict[str, Any]:
+def trade_guardian_test_telegram_endpoint(payload: TradeGuardianTestAlertRequest | None = None, request: Request = None) -> Dict[str, Any]:
     try:
-        return send_trade_guardian_test_alert(request.state.current_user, payload.text)
+        if request is None:
+            raise HTTPException(status_code=500, detail="Trade Guardian Telegram test failed")
+        message_text = (payload.text if payload else "Trade Guardian test alert")
+        return send_trade_guardian_test_alert(request.state.current_user, message_text)
     except Exception as exc:
         logger.error("Trade Guardian Telegram test failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Trade Guardian Telegram test failed") from exc
