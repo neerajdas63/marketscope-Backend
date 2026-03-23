@@ -14,11 +14,24 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from backend.auth_access import authorize_request
 from cache import InMemoryCache
 from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
 from backend.pulse_navigator import get_pulse_navigator, get_pulse_navigator_tab
+from backend.trade_guardian import (
+    acknowledge_alert,
+    close_trade,
+    create_trade,
+    get_trade_detail,
+    get_trade_guardian_summary,
+    init_trade_guardian_storage,
+    list_alerts,
+    list_trades,
+    run_trade_guardian_monitor_cycle,
+    send_trade_guardian_test_alert,
+)
 from fetcher import fetch_all_sectors
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -52,6 +65,28 @@ cache: InMemoryCache = InMemoryCache()
 CACHE_DURATION_SECONDS: int = int(os.getenv("CACHE_DURATION_SECONDS", 300))
 INITIAL_CACHE_RETRY_ATTEMPTS: int = int(os.getenv("INITIAL_CACHE_RETRY_ATTEMPTS", 3))
 INITIAL_CACHE_RETRY_DELAY_SECONDS: float = float(os.getenv("INITIAL_CACHE_RETRY_DELAY_SECONDS", 5))
+TRADE_GUARDIAN_POLL_SECONDS: int = max(2, int(os.getenv("TRADE_GUARDIAN_POLL_SECONDS", "5")))
+
+_trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
+
+
+class TradeGuardianCreateRequest(BaseModel):
+    symbol: str = Field(..., min_length=1)
+    direction: str = Field(..., min_length=4)
+    entry_price: float = Field(..., gt=0)
+    stop_loss: float = Field(..., gt=0)
+    target_1: float = Field(..., gt=0)
+    target_2: float = Field(..., gt=0)
+    quantity: float = Field(default=0, ge=0)
+    notes: str = Field(default="")
+
+
+class TradeGuardianCloseRequest(BaseModel):
+    reason: str = Field(default="closed_manual")
+
+
+class TradeGuardianTestAlertRequest(BaseModel):
+    text: str = Field(default="Trade Guardian test alert")
 
 
 def _warming_up_response(message: str = "Data cache is warming up", **payload: Any) -> Dict[str, Any]:
@@ -96,6 +131,14 @@ def _momentum_snapshot_job() -> None:
     if not data:
         return
     momentum_take_snapshot(data.get("sectors", []))
+
+
+async def _trade_guardian_monitor_job() -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(_trade_guardian_executor, run_trade_guardian_monitor_cycle)
+    except Exception as exc:
+        logger.error("Trade Guardian monitor job failed: %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +205,7 @@ async def _bg_backfill() -> None:
 async def lifespan(app: FastAPI):
     """Warm the critical cache before reporting the server as ready."""
     logger.info("MarketScope starting...")
+    init_trade_guardian_storage()
 
     # Give sector_momentum a reference to the cache for EOD fallback snapshots
     momentum_set_cache_ref(cache)
@@ -185,6 +229,19 @@ async def lifespan(app: FastAPI):
         misfire_grace_time=60,
     )
     logger.info("Sector momentum snapshot job registered (cron-aligned).")
+
+    scheduler.add_job(
+        _trade_guardian_monitor_job,
+        trigger="interval",
+        seconds=TRADE_GUARDIAN_POLL_SECONDS,
+        id="trade_guardian_monitor",
+        name="Trade Guardian live monitor",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=15,
+    )
+    logger.info("Trade Guardian monitor job registered (%ss interval).", TRADE_GUARDIAN_POLL_SECONDS)
 
     # Start initial fetch in the background (non-blocking)
     asyncio.create_task(_bg_init_fetch())
@@ -351,6 +408,7 @@ async def pulse_navigator_endpoint(
             feature_key="pulse_navigator",
             tabs={
                 "discover": {"tab": "discover", "title": "Discover", "buckets": []},
+                "leaders": {"tab": "leaders", "title": "Session Leaders", "longs": [], "shorts": []},
                 "fresh": {"tab": "fresh", "title": "Fresh Movers", "stocks": []},
                 "sectors": {"tab": "sectors", "title": "Sector Leaders", "sectors": []},
             },
@@ -415,6 +473,33 @@ async def pulse_navigator_fresh_endpoint(
     except Exception as exc:
         logger.error("Pulse Navigator fresh endpoint error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Pulse Navigator fresh computation failed") from exc
+
+
+@app.get("/pulse-navigator/leaders", summary="Pulse Navigator session leaders tab", tags=["Market Data"])
+async def pulse_navigator_leaders_endpoint(
+    limit: int = 12,
+    preset: str = "balanced",
+    direction: str = "ALL",
+) -> Dict[str, Any]:
+    cached = cache.get()
+    if not cached:
+        return _warming_up_response(
+            message="Pulse Navigator leaders tab is warming up",
+            tab={"tab": "leaders", "title": "Session Leaders", "longs": [], "shorts": []},
+        )
+
+    try:
+        return get_pulse_navigator_tab(
+            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            last_updated=str(cached.get("last_updated", "") or ""),
+            tab="leaders",
+            preset=preset,
+            direction=direction,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Pulse Navigator leaders endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Pulse Navigator leaders computation failed") from exc
 
 
 @app.get("/pulse-navigator/sectors", summary="Pulse Navigator sector leaders tab", tags=["Market Data"])
@@ -975,7 +1060,101 @@ def health() -> Dict[str, Any]:
         "market_open": is_market_hours(),
         "total_sectors": total_sectors,
         "total_stocks": total_stocks,
+        "trade_guardian_poll_seconds": TRADE_GUARDIAN_POLL_SECONDS,
     }
+
+
+# ---------------------------------------------------------------------------
+# Trade Guardian
+# ---------------------------------------------------------------------------
+
+@app.get("/api/trade-guardian", summary="Trade Guardian summary", tags=["Trade Guardian"])
+def trade_guardian_summary_endpoint(request: Request) -> Dict[str, Any]:
+    try:
+        return get_trade_guardian_summary(request.state.current_user)
+    except Exception as exc:
+        logger.error("Trade Guardian summary error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian summary failed") from exc
+
+
+@app.get("/api/trade-guardian/trades", summary="List Trade Guardian trades", tags=["Trade Guardian"])
+def trade_guardian_trades_endpoint(request: Request, include_closed: bool = False) -> Dict[str, Any]:
+    try:
+        return list_trades(request.state.current_user, include_closed=include_closed)
+    except Exception as exc:
+        logger.error("Trade Guardian trade list error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian trade list failed") from exc
+
+
+@app.get("/api/trade-guardian/trades/{trade_id}", summary="Trade Guardian trade detail", tags=["Trade Guardian"])
+def trade_guardian_trade_detail_endpoint(trade_id: str, request: Request) -> Dict[str, Any]:
+    try:
+        return get_trade_detail(request.state.current_user, trade_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Trade Guardian trade detail error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian trade detail failed") from exc
+
+
+@app.post("/api/trade-guardian/trades", summary="Create Trade Guardian trade", tags=["Trade Guardian"])
+def trade_guardian_create_trade_endpoint(payload: TradeGuardianCreateRequest, request: Request) -> Dict[str, Any]:
+    try:
+        return create_trade(request.state.current_user, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Trade Guardian create trade error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian create trade failed") from exc
+
+
+@app.post("/api/trade-guardian/trades/{trade_id}/close", summary="Close Trade Guardian trade", tags=["Trade Guardian"])
+def trade_guardian_close_trade_endpoint(trade_id: str, payload: TradeGuardianCloseRequest, request: Request) -> Dict[str, Any]:
+    try:
+        return close_trade(request.state.current_user, trade_id, payload.reason)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Trade Guardian close trade error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian close trade failed") from exc
+
+
+@app.get("/api/trade-guardian/alerts", summary="List Trade Guardian alerts", tags=["Trade Guardian"])
+def trade_guardian_alerts_endpoint(request: Request, include_resolved: bool = False) -> Dict[str, Any]:
+    try:
+        return list_alerts(request.state.current_user, include_resolved=include_resolved)
+    except Exception as exc:
+        logger.error("Trade Guardian alert list error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian alert list failed") from exc
+
+
+@app.post("/api/trade-guardian/alerts/{alert_id}/acknowledge", summary="Acknowledge Trade Guardian alert", tags=["Trade Guardian"])
+def trade_guardian_ack_alert_endpoint(alert_id: str, request: Request) -> Dict[str, Any]:
+    try:
+        return acknowledge_alert(request.state.current_user, alert_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Trade Guardian alert acknowledge error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian alert acknowledge failed") from exc
+
+
+@app.post("/api/trade-guardian/monitor", summary="Run Trade Guardian monitor cycle", tags=["Trade Guardian"])
+def trade_guardian_monitor_endpoint() -> Dict[str, Any]:
+    try:
+        return run_trade_guardian_monitor_cycle()
+    except Exception as exc:
+        logger.error("Trade Guardian monitor error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian monitor failed") from exc
+
+
+@app.post("/api/trade-guardian/test-telegram", summary="Send Trade Guardian Telegram test", tags=["Trade Guardian"])
+def trade_guardian_test_telegram_endpoint(payload: TradeGuardianTestAlertRequest, request: Request) -> Dict[str, Any]:
+    try:
+        return send_trade_guardian_test_alert(request.state.current_user, payload.text)
+    except Exception as exc:
+        logger.error("Trade Guardian Telegram test failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade Guardian Telegram test failed") from exc
 
 
 # ---------------------------------------------------------------------------

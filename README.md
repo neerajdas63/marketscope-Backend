@@ -41,6 +41,10 @@ The API will be available at **http://localhost:8000**.
 | `CACHE_DURATION_SECONDS`  | `300`   | Seconds before cached data is considered stale |
 | `MARKET_OPEN_TIME`        | `09:15` | NSE market open time (informational)           |
 | `MARKET_CLOSE_TIME`       | `15:30` | NSE market close time (informational)          |
+| `TELEGRAM_BOT_TOKEN`      | ``      | Telegram bot token for Trade Guardian alerts   |
+| `TELEGRAM_CHAT_ID`        | ``      | Telegram chat id for alert delivery            |
+| `TRADE_GUARDIAN_POLL_SECONDS` | `5` | Trade Guardian monitoring interval in seconds  |
+| `TRADE_GUARDIAN_REPEAT_SECONDS` | `60` | Repeat interval for unacknowledged alerts  |
 
 ---
 
@@ -109,6 +113,46 @@ Server and cache health check.
   "total_stocks": 253
 }
 ```
+
+---
+
+## Trade Guardian
+
+Trade Guardian is a manual trade tracking layer that monitors live prices and sends Telegram alerts for:
+
+- entry triggered
+- stop loss hit
+- target 1 hit
+- target 2 hit
+- repeated reminders for unacknowledged critical alerts
+
+### Trade Guardian endpoints
+
+- `GET /api/trade-guardian`
+- `GET /api/trade-guardian/trades`
+- `GET /api/trade-guardian/trades/{trade_id}`
+- `POST /api/trade-guardian/trades`
+- `POST /api/trade-guardian/trades/{trade_id}/close`
+- `GET /api/trade-guardian/alerts`
+- `POST /api/trade-guardian/alerts/{alert_id}/acknowledge`
+- `POST /api/trade-guardian/monitor`
+- `POST /api/trade-guardian/test-telegram`
+
+### Trade Guardian create payload
+
+Required fields:
+
+- `symbol`
+- `direction`
+- `entry_price`
+- `stop_loss`
+- `target_1`
+- `target_2`
+
+Optional fields:
+
+- `quantity`
+- `notes`
 
 ---
 
