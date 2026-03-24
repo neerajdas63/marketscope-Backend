@@ -183,7 +183,7 @@ async def _bg_init_fetch() -> None:
         scanner_stocks    = cache.get().get("scanner_stocks", [])
         loop              = asyncio.get_running_loop()
         _radar_ex         = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar-init")
-        loop.run_in_executor(_radar_ex, refresh_fo_radar_cache, fo_clean, scanner_stocks)
+        loop.run_in_executor(_radar_ex, refresh_fo_radar_cache, fo_clean, scanner_stocks, False)
         logger.info("[BG] F&O Radar OI refresh started in background (%d symbols).", len(fo_clean))
     except Exception as exc:
         logger.warning("[BG] Could not start F&O Radar refresh: %s", exc)
@@ -1283,6 +1283,7 @@ async def fo_radar_refresh_endpoint() -> Dict[str, Any]:
         refresh_fo_radar_cache,
         fo_clean,
         scanner_stocks_data,
+        True,
     )
     return {"status": "refresh_started", "symbols": len(fo_clean)}
 

@@ -33,6 +33,8 @@ _DEFAULT_OI_SYMBOLS = [
     "BHARTIARTL", "HCLTECH", "TITAN", "MARUTI", "TATASTEEL",
     "BAJAJ-AUTO", "DRREDDY", "CIPLA", "DIVISLAB", "TECHM",
 ]
+_FO_RADAR_MAX_SYMBOLS = max(10, int(os.getenv("FO_RADAR_MAX_SYMBOLS", "36")))
+_FO_RADAR_MIN_REFRESH_SECONDS = max(60, int(os.getenv("FO_RADAR_MIN_REFRESH_SECONDS", "900")))
 
 
 def _build_compact_chain_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -375,6 +377,42 @@ _fo_radar_cache_at: float   = 0.0
 _fo_radar_lock = threading.Lock()
 
 
+def _select_fo_radar_symbols(fo_symbols: List[str], stock_map: Dict[str, Dict]) -> List[str]:
+    available_symbols = [symbol for symbol in fo_symbols if symbol in stock_map]
+    if not available_symbols:
+        return []
+
+    selected: List[str] = []
+    seen: set[str] = set()
+
+    for symbol in _DEFAULT_OI_SYMBOLS:
+        clean_symbol = str(symbol or "").strip().upper().replace(".NS", "")
+        if clean_symbol in stock_map and clean_symbol not in seen:
+            selected.append(clean_symbol)
+            seen.add(clean_symbol)
+            if len(selected) >= _FO_RADAR_MAX_SYMBOLS:
+                return selected
+
+    ranked_candidates = sorted(
+        available_symbols,
+        key=lambda sym: (
+            abs(float(stock_map[sym].get("change_pct", 0) or 0)),
+            float(stock_map[sym].get("volume_ratio", 0) or 0),
+            abs(float(stock_map[sym].get("boost_score", 0) or 0)),
+        ),
+        reverse=True,
+    )
+    for symbol in ranked_candidates:
+        if symbol in seen:
+            continue
+        selected.append(symbol)
+        seen.add(symbol)
+        if len(selected) >= _FO_RADAR_MAX_SYMBOLS:
+            break
+
+    return selected
+
+
 def compute_fo_trade_signal(oi_data: dict, stock_data: dict) -> dict:
     """
     Merge OI + price-action fields and compute a BUY / SELL / AVOID trade signal.
@@ -514,7 +552,7 @@ def compute_fo_trade_signal(oi_data: dict, stock_data: dict) -> dict:
     }
 
 
-def refresh_fo_radar_cache(fo_symbols: List[str], price_data: List[Dict]) -> None:
+def refresh_fo_radar_cache(fo_symbols: List[str], price_data: List[Dict], force: bool = False) -> None:
     """
     Background job: fetch OI for all F&O symbols sequentially, merge with cache,
     compute trade signals, and store result in _fo_radar_cache.
@@ -545,11 +583,22 @@ def refresh_fo_radar_cache(fo_symbols: List[str], price_data: List[Dict]) -> Non
             if sym:
                 stock_map[sym] = item
 
-    # Only process symbols that exist in the cache (have price data)
-    symbols_to_fetch = [s for s in fo_symbols if s in stock_map]
+    with _fo_radar_lock:
+        cache_age = time.monotonic() - _fo_radar_cache_at if _fo_radar_cache_at > 0 else float("inf")
+    if not force and cache_age < _FO_RADAR_MIN_REFRESH_SECONDS:
+        logger.info(
+            "F&O Radar refresh skipped — cache age %.1fs is below minimum refresh interval %ss.",
+            cache_age,
+            _FO_RADAR_MIN_REFRESH_SECONDS,
+        )
+        return
+
+    # Only process a capped high-signal subset that exists in the cache (has price data)
+    symbols_to_fetch = _select_fo_radar_symbols(fo_symbols, stock_map)
     logger.info(
-        "F&O Radar refresh: fetching OI for %d symbols sequentially…",
+        "F&O Radar refresh: fetching OI for %d symbols sequentially%s…",
         len(symbols_to_fetch),
+        " (forced)" if force else "",
     )
 
     results: List[Dict] = []

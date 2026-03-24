@@ -46,6 +46,8 @@ The API will be available at **http://localhost:8000**.
 | `TRADE_GUARDIAN_POLL_SECONDS` | `10` | Trade Guardian monitoring interval in seconds |
 | `TRADE_GUARDIAN_STARTUP_DELAY_SECONDS` | `20` | Delay before Trade Guardian starts polling after app boot |
 | `TRADE_GUARDIAN_REPEAT_SECONDS` | `60` | Repeat interval for unacknowledged alerts  |
+| `FO_RADAR_MAX_SYMBOLS` | `36` | Max F&O Radar symbols to refresh in each automatic background cycle |
+| `FO_RADAR_MIN_REFRESH_SECONDS` | `900` | Minimum seconds between automatic F&O Radar refreshes |
 
 ---
 

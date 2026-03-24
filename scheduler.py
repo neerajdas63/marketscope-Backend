@@ -83,8 +83,8 @@ async def scheduled_fetch(cache_obj: "InMemoryCache") -> None:
             fo_clean = [s.replace(".NS", "") for s in FO_STOCKS]
             scanner_stocks = data.get("scanner_stocks", [])
             _radar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar")
-            loop.run_in_executor(_radar_executor, refresh_fo_radar_cache, fo_clean, scanner_stocks)
-            logger.info("F&O Radar background refresh started (%d symbols).", len(fo_clean))
+            loop.run_in_executor(_radar_executor, refresh_fo_radar_cache, fo_clean, scanner_stocks, False)
+            logger.info("F&O Radar background refresh started (%d candidate symbols).", len(fo_clean))
         except Exception as radar_exc:
             logger.warning("F&O Radar refresh could not start: %s", radar_exc)
     except asyncio.TimeoutError:
