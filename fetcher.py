@@ -243,6 +243,41 @@ def _compute_change_pct(ltp: float, prev_close: float, fallback_change_pct: floa
     return round(fallback_change_pct, 2)
 
 
+def _build_heatmap_diagnostics(sym_data: Dict[str, Any]) -> Dict[str, Any]:
+    quote_source_counts: Dict[str, int] = {}
+    zero_change_symbols: List[str] = []
+    near_zero_change_symbols: List[str] = []
+    non_zero_change_count = 0
+    neutral_direction_count = 0
+
+    for symbol, stock in sym_data.items():
+        quote_source = str(stock.get("quote_source") or "unknown")
+        quote_source_counts[quote_source] = quote_source_counts.get(quote_source, 0) + 1
+
+        change_pct = _safe_float(stock.get("change_pct"))
+        if change_pct == 0.0:
+            zero_change_symbols.append(symbol)
+        else:
+            non_zero_change_count += 1
+            if abs(change_pct) < 0.05:
+                near_zero_change_symbols.append(symbol)
+
+        if str(stock.get("inferred_direction") or "NEUTRAL") == "NEUTRAL":
+            neutral_direction_count += 1
+
+    total_symbols = len(sym_data)
+    return {
+        "total_symbols": total_symbols,
+        "quote_source_counts": quote_source_counts,
+        "zero_change_count": len(zero_change_symbols),
+        "non_zero_change_count": non_zero_change_count,
+        "zero_change_ratio": round((len(zero_change_symbols) / total_symbols), 3) if total_symbols else 0.0,
+        "neutral_direction_count": neutral_direction_count,
+        "zero_change_samples": zero_change_symbols[:20],
+        "near_zero_change_samples": near_zero_change_symbols[:20],
+    }
+
+
 def _fetch_prev_close(symbol: str) -> float:
     """
     Fetch the official previous trading day closing price for a symbol
@@ -620,9 +655,18 @@ def fetch_all_sectors() -> Dict[str, Any]:
         f"Market open: {market_open}"
     )
 
+    diagnostics = _build_heatmap_diagnostics(sym_data)
+    logger.info(
+        "Heatmap diagnostics: %d symbols, %d zero-change, sources=%s",
+        diagnostics["total_symbols"],
+        diagnostics["zero_change_count"],
+        diagnostics["quote_source_counts"],
+    )
+
     return {
         "sectors": sectors_result,
         "scanner_stocks": scanner_stocks_result,
         "last_updated": now_ist.strftime("%H:%M:%S"),
         "market_open": market_open,
+        "diagnostics": diagnostics,
     }
