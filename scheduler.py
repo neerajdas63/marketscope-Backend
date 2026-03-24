@@ -23,6 +23,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 FETCH_TIMEOUT_SECONDS = int(os.getenv("FETCH_TIMEOUT_SECONDS", 240))
+ENABLE_FO_RADAR = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_momentum_scanner_stocks(data: dict) -> list:
+    return list(data.get("scanner_stocks_upstox") or data.get("scanner_stocks") or [])
 
 
 def is_market_hours() -> bool:
@@ -68,7 +73,7 @@ async def scheduled_fetch(cache_obj: "InMemoryCache") -> None:
         )
         cache_obj.set(data)
         schedule_momentum_pulse_refresh(
-            scanner_stocks=list(data.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(data),
             last_updated=str(data.get("last_updated", "") or ""),
             force=True,
         )
@@ -77,6 +82,9 @@ async def scheduled_fetch(cache_obj: "InMemoryCache") -> None:
 
         # Kick off F&O Radar OI refresh in background (sequential ~1.2s/symbol,
         # so we never await it — it runs independently in its own thread)
+        if not ENABLE_FO_RADAR:
+            logger.info("F&O Radar background refresh disabled by config.")
+            return
         try:
             from stocks import FO_STOCKS
             from oi_analysis import refresh_fo_radar_cache

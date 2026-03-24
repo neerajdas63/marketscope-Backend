@@ -243,6 +243,88 @@ def _compute_change_pct(ltp: float, prev_close: float, fallback_change_pct: floa
     return round(fallback_change_pct, 2)
 
 
+def _build_sym_data(
+    symbols: List[str],
+    primary_quotes: Dict[str, Any],
+    secondary_quotes: Dict[str, Any],
+    angel_ltp: Dict[str, float],
+    prev_close_reference: Dict[str, float],
+    avg_volume_by_symbol: Dict[str, float],
+) -> Dict[str, Any]:
+    sym_data: Dict[str, Any] = {}
+    for symbol in symbols:
+        try:
+            clean = symbol.replace(".NS", "")
+            q = primary_quotes.get(clean) or secondary_quotes.get(clean)
+            angel_price = angel_ltp.get(clean)
+
+            if not q or q.get("ltp", 0) <= 0:
+                prev_close_fb = _safe_float(prev_close_reference.get(clean))
+                ltp_fb = round(float(angel_price or 0), 2)
+                if ltp_fb <= 0 or prev_close_fb <= 0:
+                    continue
+                change_fb = _compute_change_pct(ltp_fb, prev_close_fb)
+                sym_data[clean] = {
+                    "symbol": clean,
+                    "ltp": ltp_fb,
+                    "change_pct": change_fb,
+                    "volume_ratio": 1.0,
+                    "fo": clean in FO_STOCKS,
+                    "day_high": ltp_fb,
+                    "day_low": ltp_fb,
+                    "day_open": ltp_fb,
+                    "vwap": 0.0,
+                    "quote_source": "yfinance_fallback" if not angel_price else "angel_ltp_fallback",
+                    "delivery_source": "unavailable_fallback",
+                    "delivery_pct": None,
+                    "bid_ask_ratio": None,
+                    "bid_qty": None,
+                    "ask_qty": None,
+                }
+                continue
+
+            live_ltp = round(float(angel_price or q.get("ltp", 0) or 0), 2)
+            quote_source = str(q.get("quote_source") or "")
+            raw_change_pct = float(q.get("change_pct", 0) or 0)
+            prev_close = float(q.get("prev_close", 0) or 0)
+            if quote_source == "upstox_full":
+                prev_close = _safe_float(prev_close_reference.get(clean)) or prev_close
+            elif prev_close <= 0:
+                prev_close = _safe_float(prev_close_reference.get(clean))
+            change_pct = _compute_change_pct(live_ltp, prev_close, raw_change_pct)
+
+            vol_ratio = 1.0
+            try:
+                nse_vol_shares = q.get("total_traded_volume", 0.0) * 100_000
+                avg_20d = _safe_float(avg_volume_by_symbol.get(clean))
+                if avg_20d > 0 and nse_vol_shares > 0:
+                    vol_ratio = round(nse_vol_shares / avg_20d, 2)
+            except Exception:
+                pass
+
+            sym_data[clean] = {
+                "symbol": clean,
+                "ltp": live_ltp,
+                "change_pct": change_pct,
+                "volume_ratio": vol_ratio,
+                "fo": clean in FO_STOCKS,
+                "day_high": q.get("day_high", live_ltp or q["ltp"]),
+                "day_low": q.get("day_low", live_ltp or q["ltp"]),
+                "day_open": q.get("day_open", live_ltp or q["ltp"]),
+                "vwap": q.get("vwap", 0.0),
+                "quote_source": q.get("quote_source", "smartapi_full"),
+                "delivery_source": q.get("delivery_source", "unknown"),
+                "delivery_pct": round(float(q.get("delivery_pct", 0) or 0), 1) if q.get("delivery_pct") is not None else None,
+                "bid_ask_ratio": round(float(q.get("bid_ask_ratio", 0) or 0), 2) if q.get("bid_qty") or q.get("ask_qty") else None,
+                "bid_qty": q.get("bid_qty") if q.get("bid_qty") or q.get("ask_qty") else None,
+                "ask_qty": q.get("ask_qty") if q.get("bid_qty") or q.get("ask_qty") else None,
+            }
+        except Exception as exc:
+            logger.warning("Skipping %s: %s", symbol, exc)
+            continue
+    return sym_data
+
+
 def _build_heatmap_diagnostics(sym_data: Dict[str, Any]) -> Dict[str, Any]:
     quote_source_counts: Dict[str, int] = {}
     zero_change_symbols: List[str] = []
@@ -465,8 +547,9 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     # Combined unique symbols: heatmap sectors + scanner universe
     _combined_symbols = list({sym for sym in ALL_SYMBOLS + SCANNER_STOCKS})
-    all_syms_str  = " ".join(_combined_symbols)
+    scanner_symbols = list(dict.fromkeys(SCANNER_STOCKS))
     clean_symbols = [s.replace(".NS", "") for s in _combined_symbols]
+    scanner_clean_symbols = [s.replace(".NS", "") for s in scanner_symbols]
 
     def get_sym_df(data, symbol):
         """Extract a single symbol's DataFrame from a (possibly multi-ticker) download result."""
@@ -484,23 +567,21 @@ def fetch_all_sectors() -> Dict[str, Any]:
     # STEP 1 — Upstox FULL quotes (primary live market data).
     # Returns per symbol: ltp, change_pct, prev_close, vwap, day_high, day_low,
     #                     total_traded_volume (lakhs), bid_ask_ratio, bid_qty, ask_qty
-    logger.info(f"Fetching Upstox FULL quotes for {len(clean_symbols)} symbols...")
+    logger.info(f"Fetching Upstox FULL quotes for {len(scanner_clean_symbols)} scanner symbols...")
     upstox_full: Dict[str, Any] = {}
     try:
-        upstox_full = get_upstox_bulk_full_quotes(clean_symbols)
-        logger.info(f"Upstox quotes received for {len(upstox_full)}/{len(clean_symbols)} symbols.")
+        upstox_full = get_upstox_bulk_full_quotes(scanner_clean_symbols)
+        logger.info(f"Upstox quotes received for {len(upstox_full)}/{len(scanner_clean_symbols)} scanner symbols.")
     except Exception as e:
         logger.warning(f"Upstox full quote fetch failed: {e}")
 
+    logger.info(f"Fetching SmartAPI FULL quotes for {len(clean_symbols)} symbols...")
     smartapi_full: Dict[str, Any] = {}
-    missing_for_smartapi = [symbol for symbol in clean_symbols if symbol not in upstox_full]
-    if missing_for_smartapi:
-        logger.info(f"Fetching SmartAPI FULL quotes for {len(missing_for_smartapi)} missing symbols...")
-        try:
-            smartapi_full = get_bulk_full_quotes(missing_for_smartapi)
-            logger.info(f"SmartAPI quotes received for {len(smartapi_full)}/{len(missing_for_smartapi)} missing symbols.")
-        except Exception as e:
-            logger.warning(f"SmartAPI full quote fetch failed: {e}")
+    try:
+        smartapi_full = get_bulk_full_quotes(clean_symbols)
+        logger.info(f"SmartAPI quotes received for {len(smartapi_full)}/{len(clean_symbols)} symbols.")
+    except Exception as e:
+        logger.warning(f"SmartAPI full quote fetch failed: {e}")
 
     angel_ltp: Dict[str, float] = {}
     missing_for_ltp = [symbol for symbol in clean_symbols if symbol not in upstox_full and symbol not in smartapi_full]
@@ -545,105 +626,67 @@ def fetch_all_sectors() -> Dict[str, Any]:
     if live_prev_close_by_symbol:
         prev_close_reference.update(live_prev_close_by_symbol)
 
-    # STEP 4 — Build sym_data: primary values from Upstox, then SmartAPI, then yfinance fallback
-    sym_data: Dict[str, Any] = {}
-    for symbol in _combined_symbols:
-        try:
-            clean = symbol.replace(".NS", "")
-            q = upstox_full.get(clean) or smartapi_full.get(clean)
-            angel_price = angel_ltp.get(clean)
+    heatmap_sym_data = _build_sym_data(
+        symbols=_combined_symbols,
+        primary_quotes=smartapi_full,
+        secondary_quotes=upstox_full,
+        angel_ltp=angel_ltp,
+        prev_close_reference=prev_close_reference,
+        avg_volume_by_symbol=avg_volume_by_symbol,
+    )
+    momentum_sym_data = _build_sym_data(
+        symbols=scanner_symbols,
+        primary_quotes=upstox_full,
+        secondary_quotes=smartapi_full,
+        angel_ltp=angel_ltp,
+        prev_close_reference=prev_close_reference,
+        avg_volume_by_symbol=avg_volume_by_symbol,
+    )
 
-            # Fall back to yfinance daily if live quote unavailable
-            if not q or q.get("ltp", 0) <= 0:
-                prev_close_fb = _safe_float(prev_close_reference.get(clean))
-                ltp_fb = round(float(angel_price or 0), 2)
-                if ltp_fb <= 0 or prev_close_fb <= 0:
-                    continue
-                change_fb = _compute_change_pct(ltp_fb, prev_close_fb)
-                sym_data[clean] = {
-                    "symbol": clean, "ltp": ltp_fb, "change_pct": change_fb,
-                    "volume_ratio": 1.0, "fo": clean in FO_STOCKS,
-                    "day_high": ltp_fb, "day_low": ltp_fb, "day_open": ltp_fb, "vwap": 0.0,
-                    "quote_source": "yfinance_fallback" if not angel_price else "angel_ltp_fallback",
-                    "delivery_source": "unavailable_fallback",
-                    "delivery_pct": None,
-                    "bid_ask_ratio": None,
-                    "bid_qty": None,
-                    "ask_qty": None,
-                }
-                continue
-
-            live_ltp = round(float(angel_price or q.get("ltp", 0) or 0), 2)
-            quote_source = str(q.get("quote_source") or "")
-            raw_change_pct = float(q.get("change_pct", 0) or 0)
-            if quote_source == "upstox_full":
-                prev_close = _safe_float(prev_close_reference.get(clean))
-                if prev_close <= 0:
-                    prev_close = float(q.get("prev_close", 0) or 0)
-            else:
-                prev_close = float(q.get("prev_close", 0) or 0)
-                if prev_close <= 0:
-                    prev_close = _safe_float(prev_close_reference.get(clean))
-            change_pct = _compute_change_pct(live_ltp, prev_close, raw_change_pct)
-
-            # Volume ratio: NSE total traded (lakhs → shares) vs 20-day yfinance avg
-            vol_ratio = 1.0
-            try:
-                nse_vol_shares = q.get("total_traded_volume", 0.0) * 100_000
-                avg_20d = _safe_float(avg_volume_by_symbol.get(clean))
-                if avg_20d > 0 and nse_vol_shares > 0:
-                    vol_ratio = round(nse_vol_shares / avg_20d, 2)
-            except Exception:
-                pass
-
-            sym_data[clean] = {
-                "symbol":       clean,
-                "ltp":          live_ltp,
-                "change_pct":   change_pct,
-                "volume_ratio": vol_ratio,
-                "fo":           clean in FO_STOCKS,
-                # Live intraday fields — used by rfactor price_action and boost
-                "day_high":     q.get("day_high",  live_ltp or q["ltp"]),
-                "day_low":      q.get("day_low",   live_ltp or q["ltp"]),
-                "day_open":     q.get("day_open",  live_ltp or q["ltp"]),
-                "vwap":         q.get("vwap",       0.0),
-                # Delivery & bid-ask written here directly so they survive even if rfactor skips
-                "quote_source":  q.get("quote_source", "smartapi_full"),
-                "delivery_source": q.get("delivery_source", "unknown"),
-                "delivery_pct":  round(float(q.get("delivery_pct", 0) or 0), 1) if q.get("delivery_pct") is not None else None,
-                "bid_ask_ratio": round(float(q.get("bid_ask_ratio", 0) or 0), 2) if q.get("bid_qty") or q.get("ask_qty") else None,
-                "bid_qty":       q.get("bid_qty") if q.get("bid_qty") or q.get("ask_qty") else None,
-                "ask_qty":       q.get("ask_qty") if q.get("bid_qty") or q.get("ask_qty") else None,
-            }
-
-        except Exception as e:
-            logger.warning(f"Skipping {symbol}: {e}")
-            continue
-
-    logger.info(f"sym_data built for {len(sym_data)} symbols (Upstox primary, SmartAPI backup, yfinance fallback).")
+    logger.info(
+        "sym_data built: heatmap=%d (SmartAPI primary), momentum=%d (Upstox primary).",
+        len(heatmap_sym_data),
+        len(momentum_sym_data),
+    )
 
     # STEP 5 — quote depth data for rfactor (delivery%, bid/ask) — sourced from live quotes
     if not upstox_full and not smartapi_full:
         logger.warning("Live depth data empty — using neutral placeholder values.")
 
     logger.info("R-Factor remains disabled — skipping unused 15-minute downloads and filling neutral placeholder fields.")
-    sym_data = _apply_neutral_rfactor_fields(sym_data)
-    sym_data = calculate_intraday_boost(sym_data, None, None)
+    heatmap_sym_data = _apply_neutral_rfactor_fields(heatmap_sym_data)
+    heatmap_sym_data = calculate_intraday_boost(heatmap_sym_data, None, None)
+    momentum_sym_data = _apply_neutral_rfactor_fields(momentum_sym_data)
+    momentum_sym_data = calculate_intraday_boost(momentum_sym_data, None, None)
 
     # STEP 6 — VWAP standard deviation bands (Feature 4)
     # Attaches vwap_position, band_1_upper/lower, band_2_upper/lower to each stock
     from vwap_bands import calculate_vwap_bands
-    for stock in sym_data.values():
+    for stock in heatmap_sym_data.values():
+        calculate_vwap_bands(stock)
+    for stock in momentum_sym_data.values():
         calculate_vwap_bands(stock)
 
     # Build scanner flat list from SCANNER_STOCKS
     scanner_stocks_result: List[Dict[str, Any]] = []
     for sym in SCANNER_STOCKS:
         clean = sym.replace(".NS", "")
-        if clean in sym_data:
-            scanner_stocks_result.append(sym_data[clean])
+        if clean in heatmap_sym_data:
+            scanner_stocks_result.append(heatmap_sym_data[clean])
     scanner_stocks_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
     logger.info(f"Scanner stocks assembled: {len(scanner_stocks_result)}/{len(SCANNER_STOCKS)} symbols.")
+
+    scanner_stocks_upstox_result: List[Dict[str, Any]] = []
+    for sym in SCANNER_STOCKS:
+        clean = sym.replace(".NS", "")
+        if clean in momentum_sym_data:
+            scanner_stocks_upstox_result.append(momentum_sym_data[clean])
+    scanner_stocks_upstox_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+    logger.info(
+        "Momentum scanner stocks assembled: %d/%d symbols.",
+        len(scanner_stocks_upstox_result),
+        len(SCANNER_STOCKS),
+    )
 
     # STEP 4 — Build sector results from sym_data (heatmap only)
     sectors_result: List[Dict[str, Any]] = []
@@ -651,8 +694,8 @@ def fetch_all_sectors() -> Dict[str, Any]:
         stocks = []
         for sym in sector_symbols:
             clean = sym.replace(".NS", "")
-            if clean in sym_data:
-                stocks.append(sym_data[clean])
+            if clean in heatmap_sym_data:
+                stocks.append(heatmap_sym_data[clean])
 
         if not stocks:
             continue
@@ -681,7 +724,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
         f"Market open: {market_open}"
     )
 
-    diagnostics = _build_heatmap_diagnostics(sym_data)
+    diagnostics = _build_heatmap_diagnostics(heatmap_sym_data)
     logger.info(
         "Heatmap diagnostics: %d symbols, %d zero-change, sources=%s",
         diagnostics["total_symbols"],
@@ -692,6 +735,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
     return {
         "sectors": sectors_result,
         "scanner_stocks": scanner_stocks_result,
+        "scanner_stocks_upstox": scanner_stocks_upstox_result,
         "last_updated": now_ist.strftime("%H:%M:%S"),
         "market_open": market_open,
         "diagnostics": diagnostics,

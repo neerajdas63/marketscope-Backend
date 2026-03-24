@@ -48,6 +48,8 @@ The API will be available at **http://localhost:8000**.
 | `TRADE_GUARDIAN_REPEAT_SECONDS` | `60` | Repeat interval for unacknowledged alerts  |
 | `FO_RADAR_MAX_SYMBOLS` | `36` | Max F&O Radar symbols to refresh in each automatic background cycle |
 | `FO_RADAR_MIN_REFRESH_SECONDS` | `900` | Minimum seconds between automatic F&O Radar refreshes |
+| `ENABLE_OI_ANALYSIS` | `false` | Enable OI analysis endpoints and background OI usage |
+| `ENABLE_FO_RADAR` | `false` | Enable F&O Radar background refresh and endpoints |
 
 ---
 

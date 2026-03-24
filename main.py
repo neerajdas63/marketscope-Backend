@@ -67,8 +67,14 @@ INITIAL_CACHE_RETRY_ATTEMPTS: int = int(os.getenv("INITIAL_CACHE_RETRY_ATTEMPTS"
 INITIAL_CACHE_RETRY_DELAY_SECONDS: float = float(os.getenv("INITIAL_CACHE_RETRY_DELAY_SECONDS", 5))
 TRADE_GUARDIAN_POLL_SECONDS: int = max(2, int(os.getenv("TRADE_GUARDIAN_POLL_SECONDS", "10")))
 TRADE_GUARDIAN_STARTUP_DELAY_SECONDS: int = max(0, int(os.getenv("TRADE_GUARDIAN_STARTUP_DELAY_SECONDS", "20")))
+ENABLE_OI_ANALYSIS: bool = str(os.getenv("ENABLE_OI_ANALYSIS", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_FO_RADAR: bool = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 _trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
+
+
+def _get_momentum_scanner_stocks(cached: Dict[str, Any]) -> list[Dict[str, Any]]:
+    return list(cached.get("scanner_stocks_upstox") or cached.get("scanner_stocks") or [])
 
 
 class TradeGuardianCreateRequest(BaseModel):
@@ -162,7 +168,7 @@ async def _bg_init_fetch() -> None:
                 initial_data = await loop.run_in_executor(ex, fetch_all_sectors)
             cache.set(initial_data)
             schedule_momentum_pulse_refresh(
-                scanner_stocks=list(initial_data.get("scanner_stocks", [])),
+                scanner_stocks=_get_momentum_scanner_stocks(initial_data),
                 last_updated=str(initial_data.get("last_updated", "") or ""),
                 force=True,
             )
@@ -177,6 +183,9 @@ async def _bg_init_fetch() -> None:
 
     # Immediately seed the F&O Radar OI cache in its own background thread.
     # This runs after the initial fetch so stock price data is already available.
+    if not ENABLE_FO_RADAR:
+        logger.info("[BG] F&O Radar background refresh disabled by config.")
+        return
     try:
         from stocks import FO_STOCKS
         fo_clean          = [s.replace(".NS", "") for s in FO_STOCKS]
@@ -398,7 +407,7 @@ async def momentum_pulse_endpoint(
 
     try:
         result = get_momentum_pulse(
-            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
             last_updated=str(cached.get("last_updated", "") or ""),
             direction=direction,
             include_veryweak=include_veryweak,
@@ -432,7 +441,7 @@ async def pulse_navigator_endpoint(
 
     try:
         return get_pulse_navigator(
-            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
             last_updated=str(cached.get("last_updated", "") or ""),
             preset=preset,
             direction=direction,
@@ -455,7 +464,7 @@ async def pulse_navigator_discover_endpoint(
 
     try:
         return get_pulse_navigator_tab(
-            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
             last_updated=str(cached.get("last_updated", "") or ""),
             tab="discover",
             preset=preset,
@@ -479,7 +488,7 @@ async def pulse_navigator_fresh_endpoint(
 
     try:
         return get_pulse_navigator_tab(
-            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
             last_updated=str(cached.get("last_updated", "") or ""),
             tab="fresh",
             preset=preset,
@@ -506,7 +515,7 @@ async def pulse_navigator_leaders_endpoint(
 
     try:
         return get_pulse_navigator_tab(
-            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
             last_updated=str(cached.get("last_updated", "") or ""),
             tab="leaders",
             preset=preset,
@@ -530,7 +539,7 @@ async def pulse_navigator_sectors_endpoint(
 
     try:
         return get_pulse_navigator_tab(
-            scanner_stocks=list(cached.get("scanner_stocks", [])),
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
             last_updated=str(cached.get("last_updated", "") or ""),
             tab="sectors",
             preset=preset,
@@ -885,6 +894,16 @@ def oi_bulk_endpoint(symbols: str = "") -> Dict[str, Any]:
     Returns OI analysis for multiple F&O symbols.
     Pass ?symbols=RELIANCE,TCS,NIFTY or leave blank for all F&O stocks.
     """
+    if not ENABLE_OI_ANALYSIS:
+        return {
+            "status": "disabled",
+            "message": "OI analysis is temporarily disabled to reduce backend load.",
+            "stocks": [],
+            "total": 0,
+            "fetched": 0,
+            "nifty": {},
+            "banknifty": {},
+        }
     from stocks import FO_STOCKS
     try:
         # Frontend may pass the sentinel string "ALL_FO_SYMBOLS" — treat it as empty
@@ -920,6 +939,12 @@ def oi_bulk_endpoint(symbols: str = "") -> Dict[str, Any]:
 @app.get("/oi/{symbol}", include_in_schema=False)
 def oi_single_endpoint(symbol: str) -> Dict[str, Any]:
     """Returns OI analysis for a single F&O stock or index (NIFTY/BANKNIFTY)."""
+    if not ENABLE_OI_ANALYSIS:
+        return {
+            "status": "disabled",
+            "message": "OI analysis is temporarily disabled to reduce backend load.",
+            "symbol": symbol.upper(),
+        }
     try:
         result = get_oi_analysis(symbol.upper())
         if not result:
@@ -1196,6 +1221,18 @@ def fo_radar_endpoint(
     - min_confidence: 1 (Low) | 2 (Medium) | 3 (High)
     - limit: max stocks to return (default 50)
     """
+    if not ENABLE_FO_RADAR:
+        return {
+            "status": "disabled",
+            "message": "F&O Radar is temporarily disabled to reduce backend load.",
+            "stocks": [],
+            "total": 0,
+            "buy_count": 0,
+            "sell_count": 0,
+            "avoid_count": 0,
+            "last_updated": cache.last_updated_str(),
+            "cache_age_seconds": None,
+        }
     stocks = get_fo_radar_snapshot()
 
     if not stocks:
@@ -1269,6 +1306,12 @@ async def fo_radar_refresh_endpoint() -> Dict[str, Any]:
     Kick off a background refresh of the F&O Radar OI cache.
     Returns immediately — the refresh runs in a background thread.
     """
+    if not ENABLE_FO_RADAR:
+        return {
+            "status": "disabled",
+            "message": "F&O Radar is temporarily disabled to reduce backend load.",
+            "symbols": 0,
+        }
     cached = cache.get()
     if not cached:
         return _warming_up_response(status="warming_up", symbols=0)
