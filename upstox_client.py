@@ -468,14 +468,19 @@ def get_bulk_full_quotes(symbols: Iterable[str]) -> Dict[str, Dict[str, Any]]:
 
             ohlc = row.get("ohlc") or {}
             last_price = float(row.get("last_price", 0) or 0)
-            prev_close = float(ohlc.get("close", 0) or 0)
+            raw_net_change = float(row.get("net_change", 0) or 0)
+            prev_close_from_net = (last_price - raw_net_change) if last_price > 0 else 0.0
+            ohlc_close = float(ohlc.get("close", 0) or 0)
+            prev_close = prev_close_from_net if prev_close_from_net > 0 else ohlc_close
+            if prev_close <= 0 and ohlc_close > 0:
+                prev_close = ohlc_close
             total_buy = int(row.get("total_buy_quantity", 0) or 0)
             total_sell = int(row.get("total_sell_quantity", 0) or 0)
             volume = float(row.get("volume", 0) or 0)
             normalized_row = {
                 "ltp": round(last_price, 2),
                 "change_pct": round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0.0,
-                "net_change": round(float(row.get("net_change", 0) or 0), 2),
+                "net_change": round(raw_net_change, 2),
                 "prev_close": round(prev_close, 2),
                 "day_open": round(float(ohlc.get("open", 0) or 0), 2),
                 "day_high": round(float(ohlc.get("high", 0) or 0), 2),
