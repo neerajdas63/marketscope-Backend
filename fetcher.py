@@ -523,8 +523,27 @@ def fetch_all_sectors() -> Dict[str, Any]:
     baseline_snapshot = _ensure_daily_baseline_cache(ALL_SYMBOLS)
     prev_close_by_symbol = baseline_snapshot.get("prev_close_by_symbol", {})
     avg_volume_by_symbol = baseline_snapshot.get("avg_volume_by_symbol", {})
+    live_prev_close_by_symbol: Dict[str, float] = {}
     if not prev_close_by_symbol:
         logger.info("Daily baseline cache is warming up; using live quote fields and neutral volume ratios for now.")
+        try:
+            ohlc_rows = get_bulk_daily_ohlc(clean_symbols)
+            live_prev_close_by_symbol = {
+                symbol: _safe_float(payload.get("prev_close"))
+                for symbol, payload in ohlc_rows.items()
+                if _safe_float(payload.get("prev_close")) > 0
+            }
+            if live_prev_close_by_symbol:
+                logger.info(
+                    "Filled live prev-close data for %d symbols from Upstox daily OHLC during heatmap fetch.",
+                    len(live_prev_close_by_symbol),
+                )
+        except Exception as exc:
+            logger.warning("Synchronous Upstox prev-close fill failed during heatmap fetch: %s", exc)
+
+    prev_close_reference = dict(prev_close_by_symbol)
+    if live_prev_close_by_symbol:
+        prev_close_reference.update(live_prev_close_by_symbol)
 
     # STEP 4 — Build sym_data: primary values from Upstox, then SmartAPI, then yfinance fallback
     sym_data: Dict[str, Any] = {}
@@ -536,7 +555,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
             # Fall back to yfinance daily if live quote unavailable
             if not q or q.get("ltp", 0) <= 0:
-                prev_close_fb = _safe_float(prev_close_by_symbol.get(clean))
+                prev_close_fb = _safe_float(prev_close_reference.get(clean))
                 ltp_fb = round(float(angel_price or 0), 2)
                 if ltp_fb <= 0 or prev_close_fb <= 0:
                     continue
@@ -555,10 +574,17 @@ def fetch_all_sectors() -> Dict[str, Any]:
                 continue
 
             live_ltp = round(float(angel_price or q.get("ltp", 0) or 0), 2)
-            prev_close = float(q.get("prev_close", 0) or 0)
-            if prev_close <= 0:
-                prev_close = _safe_float(prev_close_by_symbol.get(clean))
-            change_pct = _compute_change_pct(live_ltp, prev_close, float(q.get("change_pct", 0) or 0))
+            quote_source = str(q.get("quote_source") or "")
+            raw_change_pct = float(q.get("change_pct", 0) or 0)
+            if quote_source == "upstox_full":
+                prev_close = _safe_float(prev_close_reference.get(clean))
+                if prev_close <= 0:
+                    prev_close = float(q.get("prev_close", 0) or 0)
+            else:
+                prev_close = float(q.get("prev_close", 0) or 0)
+                if prev_close <= 0:
+                    prev_close = _safe_float(prev_close_reference.get(clean))
+            change_pct = _compute_change_pct(live_ltp, prev_close, raw_change_pct)
 
             # Volume ratio: NSE total traded (lakhs → shares) vs 20-day yfinance avg
             vol_ratio = 1.0
