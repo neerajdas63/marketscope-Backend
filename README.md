@@ -43,7 +43,8 @@ The API will be available at **http://localhost:8000**.
 | `MARKET_CLOSE_TIME`       | `15:30` | NSE market close time (informational)          |
 | `TELEGRAM_BOT_TOKEN`      | ``      | Telegram bot token for Trade Guardian alerts   |
 | `TELEGRAM_CHAT_ID`        | ``      | Telegram chat id for alert delivery            |
-| `TRADE_GUARDIAN_POLL_SECONDS` | `5` | Trade Guardian monitoring interval in seconds  |
+| `TRADE_GUARDIAN_POLL_SECONDS` | `10` | Trade Guardian monitoring interval in seconds |
+| `TRADE_GUARDIAN_STARTUP_DELAY_SECONDS` | `20` | Delay before Trade Guardian starts polling after app boot |
 | `TRADE_GUARDIAN_REPEAT_SECONDS` | `60` | Repeat interval for unacknowledged alerts  |
 
 ---

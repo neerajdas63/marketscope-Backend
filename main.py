@@ -5,7 +5,7 @@ os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -65,7 +65,8 @@ cache: InMemoryCache = InMemoryCache()
 CACHE_DURATION_SECONDS: int = int(os.getenv("CACHE_DURATION_SECONDS", 300))
 INITIAL_CACHE_RETRY_ATTEMPTS: int = int(os.getenv("INITIAL_CACHE_RETRY_ATTEMPTS", 3))
 INITIAL_CACHE_RETRY_DELAY_SECONDS: float = float(os.getenv("INITIAL_CACHE_RETRY_DELAY_SECONDS", 5))
-TRADE_GUARDIAN_POLL_SECONDS: int = max(2, int(os.getenv("TRADE_GUARDIAN_POLL_SECONDS", "5")))
+TRADE_GUARDIAN_POLL_SECONDS: int = max(2, int(os.getenv("TRADE_GUARDIAN_POLL_SECONDS", "10")))
+TRADE_GUARDIAN_STARTUP_DELAY_SECONDS: int = max(0, int(os.getenv("TRADE_GUARDIAN_STARTUP_DELAY_SECONDS", "20")))
 
 _trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
 
@@ -121,6 +122,11 @@ def _is_after_open_today() -> bool:
         return False
     open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
     return now >= open_time
+
+
+def _should_backfill_opening_window() -> bool:
+    """Return True only while the 9:15-10:00 opening backfill window is still relevant."""
+    return _is_momentum_window()
 
 
 def _momentum_snapshot_job() -> None:
@@ -185,6 +191,9 @@ async def _bg_init_fetch() -> None:
 
 async def _bg_backfill() -> None:
     """Backfill opening momentum slots after a post-open server start."""
+    if not _should_backfill_opening_window():
+        logger.info("[BG] Skipping opening backfill outside the 9:15-10:00 momentum window.")
+        return
     try:
         logger.info("[BG] Backfilling opening momentum slots...")
         loop = asyncio.get_running_loop()
@@ -240,16 +249,23 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
         misfire_grace_time=15,
+        next_run_time=datetime.now() + timedelta(seconds=TRADE_GUARDIAN_STARTUP_DELAY_SECONDS),
     )
-    logger.info("Trade Guardian monitor job registered (%ss interval).", TRADE_GUARDIAN_POLL_SECONDS)
+    logger.info(
+        "Trade Guardian monitor job registered (%ss interval, %ss startup delay).",
+        TRADE_GUARDIAN_POLL_SECONDS,
+        TRADE_GUARDIAN_STARTUP_DELAY_SECONDS,
+    )
 
     # Start initial fetch in the background (non-blocking)
     asyncio.create_task(_bg_init_fetch())
 
     # Catch-up backfill also runs in the background if started after market open.
-    if _is_after_open_today():
-        logger.info("Server started after market open — scheduling background backfill...")
+    if _should_backfill_opening_window():
+        logger.info("Server started during opening window — scheduling background backfill...")
         asyncio.create_task(_bg_backfill())
+    elif _is_after_open_today():
+        logger.info("Server started after opening window — skipping background backfill.")
 
     logger.info("MarketScope startup complete — server is ready.")
 
