@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Sequence
 import pytz
 
 from backend.momentum_pulse import get_momentum_pulse
+from runtime_state import load_json_state, save_json_state
 from stocks import SECTORS
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -15,8 +16,8 @@ LEADER_CONFIRMATION_STEPS = 2
 SECTOR_TAB_LIMIT = 5
 SECTOR_AGGREGATE_DEPTH = 3
 
-_navigator_lock = threading.Lock()
-_navigator_state: Dict[str, Any] = {
+_navigator_lock = threading.RLock()
+_DEFAULT_NAVIGATOR_STATE: Dict[str, Any] = {
     "source_key": "",
     "current_ranks": {},
     "fresh_symbols": [],
@@ -26,6 +27,24 @@ _navigator_state: Dict[str, Any] = {
         "SHORT": {"symbol": "", "challenger": "", "challenger_steps": 0},
     },
 }
+_navigator_state: Dict[str, Any] = {
+    **_DEFAULT_NAVIGATOR_STATE,
+    **dict(load_json_state("pulse_navigator_state.json", {}) or {}),
+}
+
+
+def _persist_navigator_state() -> None:
+    with _navigator_lock:
+        save_json_state(
+            "pulse_navigator_state.json",
+            {
+                "source_key": str(_navigator_state.get("source_key") or ""),
+                "current_ranks": dict(_navigator_state.get("current_ranks") or {}),
+                "fresh_symbols": list(_navigator_state.get("fresh_symbols") or []),
+                "leader_session_key": str(_navigator_state.get("leader_session_key") or ""),
+                "leaders": dict(_navigator_state.get("leaders") or {}),
+            },
+        )
 
 _ACTIONABILITY_PRIORITY = {
     "clean_setup": 3,
@@ -299,6 +318,7 @@ def _select_stable_session_leader(items: Sequence[Dict[str, Any]], direction: st
                 "challenger": "",
                 "challenger_steps": 0,
             }
+            _persist_navigator_state()
             return preferred
 
         incumbent_score = _safe_float(incumbent.get("session_leader_score"))
@@ -309,6 +329,7 @@ def _select_stable_session_leader(items: Sequence[Dict[str, Any]], direction: st
                 "challenger": "",
                 "challenger_steps": 0,
             }
+            _persist_navigator_state()
             return incumbent
 
         challenger_symbol = str(preferred.get("symbol") or "")
@@ -322,6 +343,7 @@ def _select_stable_session_leader(items: Sequence[Dict[str, Any]], direction: st
                 "challenger": "",
                 "challenger_steps": 0,
             }
+            _persist_navigator_state()
             return preferred
 
         _navigator_state["leaders"][direction] = {
@@ -329,6 +351,7 @@ def _select_stable_session_leader(items: Sequence[Dict[str, Any]], direction: st
             "challenger": challenger_symbol,
             "challenger_steps": challenger_steps,
         }
+        _persist_navigator_state()
         return incumbent
 
 
@@ -490,6 +513,7 @@ def _detect_fresh_entries(items: Sequence[Dict[str, Any]], source_key: str) -> L
             _navigator_state["source_key"] = source_key
             _navigator_state["current_ranks"] = current_ranks
             _navigator_state["fresh_symbols"] = fresh_symbols
+            _persist_navigator_state()
         return list(_navigator_state.get("fresh_symbols") or [])
 
 

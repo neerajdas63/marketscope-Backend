@@ -16,6 +16,7 @@ os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
 import yfinance as yf
 
 from nse_fetcher import fetch_nse_index_quotes
+from runtime_state import load_json_state, save_json_state
 from upstox_client import get_intraday_history_batch, get_underlying_snapshot
 
 logger = logging.getLogger("momentum_pulse")
@@ -26,7 +27,7 @@ MAX_HISTORY_POINTS = 24
 REFRESH_COOLDOWN_SECONDS = 240
 MIN_SESSION_BARS = 1
 
-_pulse_cache: Dict[str, Any] = {
+_DEFAULT_PULSE_CACHE: Dict[str, Any] = {
     "source_key": "",
     "computed_at": 0.0,
     "last_updated": "",
@@ -37,8 +38,34 @@ _pulse_cache: Dict[str, Any] = {
     "last_attempt": 0.0,
     "error": "",
 }
-_score_state: Dict[str, Dict[str, Any]] = {}
+_persisted_runtime = load_json_state("momentum_pulse_state.json", {})
+_pulse_cache: Dict[str, Any] = {
+    **_DEFAULT_PULSE_CACHE,
+    **dict(_persisted_runtime.get("pulse_cache") or {}),
+}
+_score_state: Dict[str, Dict[str, Any]] = dict(_persisted_runtime.get("score_state") or {})
 _lock = threading.Lock()
+
+
+def _persist_runtime_state() -> None:
+    with _lock:
+        save_json_state(
+            "momentum_pulse_state.json",
+            {
+                "pulse_cache": {
+                    "source_key": str(_pulse_cache.get("source_key") or ""),
+                    "computed_at": _safe_float(_pulse_cache.get("computed_at")),
+                    "last_updated": str(_pulse_cache.get("last_updated") or ""),
+                    "benchmark_change_pct": _safe_float(_pulse_cache.get("benchmark_change_pct")),
+                    "results": list(_pulse_cache.get("results") or []),
+                    "has_completed": bool(_pulse_cache.get("has_completed")),
+                    "is_loading": bool(_pulse_cache.get("is_loading")),
+                    "last_attempt": _safe_float(_pulse_cache.get("last_attempt")),
+                    "error": str(_pulse_cache.get("error") or ""),
+                },
+                "score_state": _score_state,
+            },
+        )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -976,6 +1003,7 @@ def _refresh_momentum_pulse_cache(source_key: str, scanner_stocks: List[Dict[str
     finally:
         with _lock:
             _pulse_cache["is_loading"] = False
+        _persist_runtime_state()
 
 
 def schedule_momentum_pulse_refresh(
