@@ -2,7 +2,7 @@
 
 import time
 import pytz
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -33,6 +33,6 @@ class InMemoryCache:
         if self.updated_at == 0:
             return "Never"
         # Use timezone-aware UTC datetime to avoid deprecation warning
-        utc_dt = datetime.fromtimestamp(self.updated_at, datetime.UTC)
+        utc_dt = datetime.fromtimestamp(self.updated_at, timezone.utc)
         ist_dt = utc_dt.astimezone(IST)
         return ist_dt.strftime("%H:%M:%S")
