@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 DAILY_BASELINE_REFRESH_SECONDS = int(os.getenv("DAILY_BASELINE_REFRESH_SECONDS", "21600"))
 LOW_RESOURCE_MODE = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
-SCANNER_SYMBOL_LIMIT = max(0, int(os.getenv("SCANNER_SYMBOL_LIMIT", "80" if LOW_RESOURCE_MODE else "0")))
+ENABLE_SCANNER_BATCH_ROTATION = str(os.getenv("ENABLE_SCANNER_BATCH_ROTATION", "true" if LOW_RESOURCE_MODE else "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+SCANNER_BATCH_SIZE = max(1, int(os.getenv("SCANNER_BATCH_SIZE", "80")))
+SCANNER_BATCH_INTERVAL_MINUTES = max(1, int(os.getenv("SCANNER_BATCH_INTERVAL_MINUTES", "3")))
+SCANNER_SYMBOL_LIMIT = max(0, int(os.getenv("SCANNER_SYMBOL_LIMIT", "0")))
 
 _daily_baseline_lock = threading.Lock()
 _daily_baseline_cache: Dict[str, Any] = {
@@ -36,12 +39,104 @@ _daily_baseline_cache: Dict[str, Any] = {
     "last_attempt": 0.0,
 }
 
+_scanner_batch_lock = threading.Lock()
+_scanner_batch_cache: Dict[str, Any] = {
+    "heatmap_rows": {},
+    "momentum_rows": {},
+    "refreshed_at_by_symbol": {},
+    "last_batch_index": -1,
+    "last_batch_started_at": "",
+    "batch_count": 0,
+}
+
 
 def _active_scanner_symbols() -> List[str]:
     scanner_symbols = list(dict.fromkeys(SCANNER_STOCKS))
     if SCANNER_SYMBOL_LIMIT > 0:
         return scanner_symbols[:SCANNER_SYMBOL_LIMIT]
     return scanner_symbols
+
+
+def _current_scanner_batch(symbols: List[str], now_ist: datetime) -> tuple[List[str], int, int]:
+    if not symbols:
+        return [], 0, 0
+    if not ENABLE_SCANNER_BATCH_ROTATION or len(symbols) <= SCANNER_BATCH_SIZE:
+        return list(symbols), 0, 1
+
+    batch_count = max(1, (len(symbols) + SCANNER_BATCH_SIZE - 1) // SCANNER_BATCH_SIZE)
+    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now_ist.weekday() > 4 or now_ist < market_open:
+        batch_index = 0
+    else:
+        elapsed_minutes = max(0, int((now_ist - market_open).total_seconds() // 60))
+        batch_index = (elapsed_minutes // SCANNER_BATCH_INTERVAL_MINUTES) % batch_count
+
+    start = batch_index * SCANNER_BATCH_SIZE
+    end = start + SCANNER_BATCH_SIZE
+    return list(symbols[start:end]), batch_index, batch_count
+
+
+def _update_scanner_batch_cache(
+    active_symbols: List[str],
+    heatmap_rows: Dict[str, Dict[str, Any]],
+    momentum_rows: Dict[str, Dict[str, Any]],
+    refreshed_at: str,
+    batch_index: int,
+    batch_count: int,
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, str]]:
+    active_clean = {symbol.replace(".NS", "") for symbol in active_symbols}
+    with _scanner_batch_lock:
+        heatmap_cache = {
+            symbol: dict(row)
+            for symbol, row in (_scanner_batch_cache.get("heatmap_rows") or {}).items()
+            if symbol in active_clean
+        }
+        momentum_cache = {
+            symbol: dict(row)
+            for symbol, row in (_scanner_batch_cache.get("momentum_rows") or {}).items()
+            if symbol in active_clean
+        }
+        refreshed_cache = {
+            symbol: str(value)
+            for symbol, value in (_scanner_batch_cache.get("refreshed_at_by_symbol") or {}).items()
+            if symbol in active_clean
+        }
+
+        for symbol, row in heatmap_rows.items():
+            heatmap_cache[symbol] = dict(row)
+            refreshed_cache[symbol] = refreshed_at
+        for symbol, row in momentum_rows.items():
+            momentum_cache[symbol] = dict(row)
+            refreshed_cache[symbol] = refreshed_at
+
+        _scanner_batch_cache["heatmap_rows"] = heatmap_cache
+        _scanner_batch_cache["momentum_rows"] = momentum_cache
+        _scanner_batch_cache["refreshed_at_by_symbol"] = refreshed_cache
+        _scanner_batch_cache["last_batch_index"] = batch_index
+        _scanner_batch_cache["last_batch_started_at"] = refreshed_at
+        _scanner_batch_cache["batch_count"] = batch_count
+
+        return dict(heatmap_cache), dict(momentum_cache), dict(refreshed_cache)
+
+
+def _attach_scanner_age(row: Dict[str, Any], refreshed_at: str, now_ist: datetime) -> Dict[str, Any]:
+    enriched = dict(row)
+    enriched["data_refreshed_at"] = refreshed_at
+    age_seconds = 0
+    if refreshed_at:
+        try:
+            refreshed_dt = datetime.strptime(refreshed_at, "%H:%M:%S")
+            refreshed_dt = now_ist.replace(
+                hour=refreshed_dt.hour,
+                minute=refreshed_dt.minute,
+                second=refreshed_dt.second,
+                microsecond=0,
+            )
+            age_seconds = max(0, int((now_ist - refreshed_dt).total_seconds()))
+        except Exception:
+            age_seconds = 0
+    enriched["data_age_seconds"] = age_seconds
+    return enriched
 
 
 def _get_sector_index_change_pct(
@@ -556,9 +651,11 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     # Combined unique symbols: heatmap sectors + scanner universe
     scanner_symbols = _active_scanner_symbols()
-    _combined_symbols = list({sym for sym in ALL_SYMBOLS + scanner_symbols})
+    now_ist = datetime.now(IST)
+    scanner_batch_symbols, scanner_batch_index, scanner_batch_count = _current_scanner_batch(scanner_symbols, now_ist)
+    _combined_symbols = list({sym for sym in ALL_SYMBOLS + scanner_batch_symbols})
     clean_symbols = [s.replace(".NS", "") for s in _combined_symbols]
-    scanner_clean_symbols = [s.replace(".NS", "") for s in scanner_symbols]
+    scanner_clean_symbols = [s.replace(".NS", "") for s in scanner_batch_symbols]
 
     def get_sym_df(data, symbol):
         """Extract a single symbol's DataFrame from a (possibly multi-ticker) download result."""
@@ -644,7 +741,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
         avg_volume_by_symbol=avg_volume_by_symbol,
     )
     momentum_sym_data = _build_sym_data(
-        symbols=scanner_symbols,
+        symbols=scanner_batch_symbols,
         primary_quotes=upstox_full,
         secondary_quotes=smartapi_full,
         angel_ltp=angel_ltp,
@@ -676,20 +773,42 @@ def fetch_all_sectors() -> Dict[str, Any]:
     for stock in momentum_sym_data.values():
         calculate_vwap_bands(stock)
 
-    # Build scanner flat list from SCANNER_STOCKS
+    current_scanner_heatmap_rows = {
+        symbol.replace(".NS", ""): heatmap_sym_data[symbol.replace(".NS", "")]
+        for symbol in scanner_symbols
+        if symbol.replace(".NS", "") in heatmap_sym_data
+    }
+    current_scanner_momentum_rows = {
+        symbol.replace(".NS", ""): momentum_sym_data[symbol.replace(".NS", "")]
+        for symbol in scanner_batch_symbols
+        if symbol.replace(".NS", "") in momentum_sym_data
+    }
+    refreshed_at = now_ist.strftime("%H:%M:%S")
+    merged_heatmap_rows, merged_momentum_rows, refreshed_at_by_symbol = _update_scanner_batch_cache(
+        active_symbols=scanner_symbols,
+        heatmap_rows=current_scanner_heatmap_rows,
+        momentum_rows=current_scanner_momentum_rows,
+        refreshed_at=refreshed_at,
+        batch_index=scanner_batch_index,
+        batch_count=scanner_batch_count,
+    )
+
+    # Build scanner flat list from active scanner symbols using merged batch cache.
     scanner_stocks_result: List[Dict[str, Any]] = []
     for sym in scanner_symbols:
         clean = sym.replace(".NS", "")
-        if clean in heatmap_sym_data:
-            scanner_stocks_result.append(heatmap_sym_data[clean])
+        row = merged_heatmap_rows.get(clean)
+        if row:
+            scanner_stocks_result.append(_attach_scanner_age(row, refreshed_at_by_symbol.get(clean, ""), now_ist))
     scanner_stocks_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
     logger.info(f"Scanner stocks assembled: {len(scanner_stocks_result)}/{len(scanner_symbols)} active symbols.")
 
     scanner_stocks_upstox_result: List[Dict[str, Any]] = []
     for sym in scanner_symbols:
         clean = sym.replace(".NS", "")
-        if clean in momentum_sym_data:
-            scanner_stocks_upstox_result.append(momentum_sym_data[clean])
+        row = merged_momentum_rows.get(clean)
+        if row:
+            scanner_stocks_upstox_result.append(_attach_scanner_age(row, refreshed_at_by_symbol.get(clean, ""), now_ist))
     scanner_stocks_upstox_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
     logger.info(
         "Momentum scanner stocks assembled: %d/%d symbols.",
@@ -720,7 +839,6 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     sectors_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
 
-    now_ist = datetime.now(IST)
     market_open = (
         now_ist.weekday() < 5
         and dt_time(9, 15) <= now_ist.time() <= dt_time(15, 30)
@@ -745,6 +863,13 @@ def fetch_all_sectors() -> Dict[str, Any]:
         "sectors": sectors_result,
         "scanner_stocks": scanner_stocks_result,
         "scanner_stocks_upstox": scanner_stocks_upstox_result,
+        "scanner_batch_rotation_enabled": ENABLE_SCANNER_BATCH_ROTATION,
+        "scanner_batch_size": SCANNER_BATCH_SIZE,
+        "scanner_batch_interval_minutes": SCANNER_BATCH_INTERVAL_MINUTES,
+        "scanner_batch_index": scanner_batch_index,
+        "scanner_batch_count": scanner_batch_count,
+        "scanner_batch_started_at": refreshed_at,
+        "scanner_batch_symbols": [symbol.replace(".NS", "") for symbol in scanner_batch_symbols],
         "last_updated": now_ist.strftime("%H:%M:%S"),
         "market_open": market_open,
         "diagnostics": diagnostics,

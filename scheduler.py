@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 LOW_RESOURCE_MODE = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SCANNER_BATCH_ROTATION = str(os.getenv("ENABLE_SCANNER_BATCH_ROTATION", "true" if LOW_RESOURCE_MODE else "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 FETCH_TIMEOUT_SECONDS = int(os.getenv("FETCH_TIMEOUT_SECONDS", 240))
-SCHEDULER_REFRESH_MINUTES = max(3, int(os.getenv("SCHEDULER_REFRESH_MINUTES", "10" if LOW_RESOURCE_MODE else "5")))
+SCHEDULER_REFRESH_MINUTES = max(1, int(os.getenv("SCHEDULER_REFRESH_MINUTES", "3" if ENABLE_SCANNER_BATCH_ROTATION else "10" if LOW_RESOURCE_MODE else "5")))
 FETCH_EXECUTOR_WORKERS = max(1, int(os.getenv("FETCH_EXECUTOR_WORKERS", "1" if LOW_RESOURCE_MODE else "2")))
 ENABLE_FO_RADAR = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 
