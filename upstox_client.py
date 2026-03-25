@@ -213,6 +213,30 @@ def _normalize_history_date_range(from_date: str, to_date: str) -> tuple[str, st
     return start.isoformat(), end.isoformat()
 
 
+def _previous_trading_day(day_value) -> Any:
+    current = pd.Timestamp(day_value).date() - timedelta(days=1)
+    while current.weekday() >= 5:
+        current -= timedelta(days=1)
+    return current
+
+
+def _normalize_minute_history_window(from_date: str, to_date: str) -> tuple[str, str]:
+    start_str, end_str = _normalize_history_date_range(from_date, to_date)
+    start = pd.Timestamp(start_str).date()
+    end = pd.Timestamp(end_str).date()
+    today_ist = pd.Timestamp.now(tz="Asia/Kolkata").date()
+
+    # Upstox minute-history rejects current-session dates during live market hours.
+    # We fetch today's candles separately from the intraday endpoint, so historical
+    # requests should stop at the previous trading day while the market is open.
+    if end >= today_ist and _is_market_open_now():
+        end = _previous_trading_day(today_ist)
+        if start > end:
+            start = end
+
+    return start.isoformat(), end.isoformat()
+
+
 def _search_instruments(query: str, exchanges: str, segments: str, records: int = 10) -> List[Dict[str, Any]]:
     if not is_upstox_configured():
         _warn_missing_token_once()
@@ -317,13 +341,13 @@ def _fetch_symbol_history_frame(symbol: str, from_date: str, to_date: str, inter
     if not instrument_key:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
-    from_date, to_date = _normalize_history_date_range(from_date, to_date)
+    history_from_date, history_to_date = _normalize_minute_history_window(from_date, to_date)
 
-    historical_key = (normalized, from_date, to_date, interval_minutes, "historical")
+    historical_key = (normalized, history_from_date, history_to_date, interval_minutes, "historical")
     historical_frame = _get_cached_history(historical_key, _HISTORICAL_CACHE_TTL_SECONDS)
     if historical_frame is None:
         payload = _request_json(
-            f"/v3/historical-candle/{instrument_key}/minutes/{interval_minutes}/{to_date}/{from_date}",
+            f"/v3/historical-candle/{instrument_key}/minutes/{interval_minutes}/{history_to_date}/{history_from_date}",
             {},
         )
         historical_candles = list((payload.get("data") or {}).get("candles") or [])
