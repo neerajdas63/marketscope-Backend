@@ -47,6 +47,7 @@ def _persist_navigator_state() -> None:
         )
 
 _ACTIONABILITY_PRIORITY = {
+    "high_conviction": 4,
     "clean_setup": 3,
     "needs_pullback": 2,
     "extended": 1,
@@ -397,26 +398,75 @@ def _build_reasons(item: Dict[str, Any]) -> List[str]:
     if abs(distance_from_vwap_pct) <= 0.6 and not bool(item.get("is_extended")):
         candidates.append((1.2, "Still trading close to VWAP"))
 
+    # OI-enriched reasons for F&O stocks
+    oi_signal = str(item.get("oi_signal") or "")
+    if oi_signal == "LONG_BUILDUP" and direction == "LONG":
+        candidates.append((2.8, "Long Buildup confirmed — OI rising with price"))
+    elif oi_signal == "SHORT_COVERING" and direction == "LONG":
+        candidates.append((2.5, "Short Covering underway — bears exiting"))
+    elif oi_signal == "SHORT_BUILDUP" and direction == "SHORT":
+        candidates.append((2.8, "Short Buildup confirmed — OI rising with price drop"))
+    elif oi_signal == "LONG_UNWINDING" and direction == "SHORT":
+        candidates.append((2.5, "Long Unwinding — bulls exiting positions"))
+
+    # Sector-relative strength reason
+    sector_rel = _safe_float(item.get("sector_relative"))
+    sector_name = str(item.get("sector_name") or "")
+    if sector_name and direction == "LONG" and sector_rel > 0.5:
+        candidates.append((sector_rel + 0.8, f"Outperforming {sector_name} by {sector_rel:.2f}%"))
+    elif sector_name and direction == "SHORT" and sector_rel < -0.5:
+        candidates.append((abs(sector_rel) + 0.8, f"Underperforming {sector_name} by {abs(sector_rel):.2f}%"))
+
+    # Volume consistency reason
+    vol_consistency = _safe_float(item.get("volume_consistency_score"))
+    if vol_consistency >= 70:
+        candidates.append((1.6, "Sustained volume across multiple bars — not a one-bar spike"))
+
     if not candidates:
         candidates.append((_safe_float(item.get("direction_confidence")) / 100.0, "Directional bias is improving"))
 
     candidates.sort(key=lambda entry: entry[0], reverse=True)
-    return [text for _, text in candidates[:3]]
+    return [text for _, text in candidates[:4]]
+
+
+def _conviction_level(item: Dict[str, Any]) -> str:
+    """Derive conviction level from quality_tags and warning_flags."""
+    if not item:
+        return "Low"
+    quality_tags = {str(t) for t in item.get("quality_tags") or []}
+    warning_count = int(item.get("warning_count", 0) or len(item.get("warning_flags") or []))
+    tag_count = len(quality_tags)
+    if tag_count >= 3 and warning_count == 0:
+        return "High"
+    if tag_count >= 2 and warning_count <= 1:
+        return "High"
+    if tag_count >= 1 and warning_count <= 1:
+        return "Medium"
+    if _safe_float(item.get("momentum_pulse_score")) >= 65 and warning_count <= 2:
+        return "Medium"
+    return "Low"
 
 
 def _actionability_label(item: Dict[str, Any]) -> str:
     warning_flags = {str(flag) for flag in item.get("warning_flags") or []}
+    quality_tags = {str(tag) for tag in item.get("quality_tags") or []}
     if "one_bar_spike" in warning_flags:
         return "risky_spike"
     if bool(item.get("is_extended")) or "far_from_vwap" in warning_flags:
         return "extended"
-    if (
+    if "momentum_decay" in warning_flags:
+        return "needs_pullback"
+    is_clean = (
         str(item.get("direction")) in {"LONG", "SHORT"}
         and _safe_float(item.get("direction_confidence")) >= 55.0
         and bool(item.get("trend_consistent"))
         and str(item.get("pulse_trend_label")) == "Rising"
         and len(warning_flags) <= 1
-    ):
+    )
+    if is_clean:
+        conviction_signals = quality_tags & {"sustained_volume", "oi_confirmed", "sector_leader", "or_breakout", "strong_accumulation"}
+        if len(conviction_signals) >= 2:
+            return "high_conviction"
         return "clean_setup"
     return "needs_pullback"
 
@@ -434,11 +484,17 @@ def _decorate_item(item: Dict[str, Any]) -> Dict[str, Any]:
     enriched["sector_aligned_relative_strength"] = round(_aligned_relative_strength(enriched), 2)
     enriched["sector_opportunity_score"] = _stock_opportunity_score(enriched)
     enriched["leader_reason"] = _leader_reason(enriched)
-    enriched["ui_tags"] = [
+    enriched["quality_tags"] = list(enriched.get("quality_tags") or [])
+    enriched["conviction_level"] = _conviction_level(enriched)
+    ui_tags = [
         str(enriched.get("direction") or "NEUTRAL"),
         str(enriched.get("tier") or "veryweak"),
         str(enriched.get("actionability_label") or "needs_pullback"),
     ]
+    for qt in enriched["quality_tags"]:
+        if qt not in ui_tags:
+            ui_tags.append(qt)
+    enriched["ui_tags"] = ui_tags
     return enriched
 
 
@@ -472,7 +528,8 @@ def _slice(items: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
 
 
 def _build_discover_tab(items: Sequence[Dict[str, Any]], limit: int) -> Dict[str, Any]:
-    clean_setups = [item for item in items if str(item.get("actionability_label")) == "clean_setup"]
+    clean_setups = [item for item in items if str(item.get("actionability_label")) in {"clean_setup", "high_conviction"}]
+    high_conviction = [item for item in items if str(item.get("actionability_label")) == "high_conviction"]
     early_movers = [item for item in items if str(item.get("time_context_bucket")) == "DISCOVERY"]
     trend_continuation = [
         item for item in items
@@ -483,16 +540,21 @@ def _build_discover_tab(items: Sequence[Dict[str, Any]], limit: int) -> Dict[str
         if str(item.get("time_context_bucket")) == "LATE" and str(item.get("direction")) in {"LONG", "SHORT"}
     ]
 
+    buckets = [
+        {"id": "curated_now", "title": "Curated Now", "stocks": _slice(items, limit)},
+    ]
+    if high_conviction:
+        buckets.append({"id": "high_conviction", "title": "High Conviction", "stocks": _slice(high_conviction, limit)})
+    buckets.extend([
+        {"id": "clean_setups", "title": "Clean Setups", "stocks": _slice(clean_setups, limit)},
+        {"id": "early_movers", "title": "Early Movers", "stocks": _slice(early_movers, limit)},
+        {"id": "trend_continuation", "title": "Trend Continuation", "stocks": _slice(trend_continuation, limit)},
+        {"id": "late_strength", "title": "Late Strength", "stocks": _slice(late_strength, limit)},
+    ])
     return {
         "tab": "discover",
         "title": "Discover",
-        "buckets": [
-            {"id": "curated_now", "title": "Curated Now", "stocks": _slice(items, limit)},
-            {"id": "clean_setups", "title": "Clean Setups", "stocks": _slice(clean_setups, limit)},
-            {"id": "early_movers", "title": "Early Movers", "stocks": _slice(early_movers, limit)},
-            {"id": "trend_continuation", "title": "Trend Continuation", "stocks": _slice(trend_continuation, limit)},
-            {"id": "late_strength", "title": "Late Strength", "stocks": _slice(late_strength, limit)},
-        ],
+        "buckets": buckets,
     }
 
 
@@ -524,6 +586,7 @@ def _build_fresh_tab(items: Sequence[Dict[str, Any]], source_key: str, limit: in
         item for item in items
         if str(item.get("symbol") or "") in fresh_symbols
         and (_safe_float(item.get("score_change_10m")) > 0 or bool(item.get("improving_now")))
+        and "momentum_decay" not in {str(f) for f in item.get("warning_flags") or []}
     ]
     if not fresh_candidates:
         selection_mode = "trend_improvers"
@@ -531,6 +594,7 @@ def _build_fresh_tab(items: Sequence[Dict[str, Any]], source_key: str, limit: in
             item for item in items
             if str(item.get("direction") or "") in {"LONG", "SHORT"}
             and str(item.get("pulse_trend_label") or "") == "Rising"
+            and "momentum_decay" not in {str(f) for f in item.get("warning_flags") or []}
             and (
                 _safe_float(item.get("score_change_10m")) >= 1.0
                 or bool(item.get("improving_now"))
@@ -653,6 +717,18 @@ def _build_sector_tab(items: Sequence[Dict[str, Any]], limit: int) -> Dict[str, 
             sum(_safe_float(entry.get("change_pct")) for entry in sector_items) / len(sector_items),
             2,
         ) if sector_items else 0.0
+
+        # Sector-relative momentum from Pulse data
+        sector_rel_values = [
+            _safe_float(entry.get("sector_relative"))
+            for entry in sector_items
+            if entry.get("sector_relative") is not None
+        ]
+        avg_sector_relative = round(sum(sector_rel_values) / len(sector_rel_values), 2) if sector_rel_values else 0.0
+        oi_confirmed_count = sum(
+            1 for entry in sector_items
+            if "oi_confirmed" in {str(t) for t in entry.get("quality_tags") or []}
+        )
         sector_cards.append(
             {
                 "sector": sector_name,
@@ -664,6 +740,8 @@ def _build_sector_tab(items: Sequence[Dict[str, Any]], limit: int) -> Dict[str, 
                 "sector_score": sector_score,
                 "market_relative_score": market_relative_score,
                 "average_change_pct": avg_change_pct,
+                "avg_sector_relative": avg_sector_relative,
+                "oi_confirmed_count": oi_confirmed_count,
                 "candidate_count": len(ranked),
                 "top_stocks": _slice(ranked, 3),
             }
@@ -697,16 +775,20 @@ def _build_hero(
     fresh_short = next(iter(fresh_tab.get("shorts") or []), None)
     strongest_sector = next(iter(sector_tab.get("sectors") or []), None)
     best_fresh = next(iter(fresh_tab.get("stocks") or []), None)
+    high_conviction_count = sum(1 for item in items if str(item.get("actionability_label")) == "high_conviction")
     return {
         "market_mode": _market_mode(items),
         "best_long": leader_long,
         "best_short": leader_short,
         "leader_long": leader_long,
         "leader_short": leader_short,
+        "leader_long_conviction": _conviction_level(leader_long) if leader_long else "Low",
+        "leader_short_conviction": _conviction_level(leader_short) if leader_short else "Low",
         "fresh_long": fresh_long,
         "fresh_short": fresh_short,
         "best_fresh": best_fresh,
         "strongest_sector": strongest_sector,
+        "high_conviction_count": high_conviction_count,
         "leaders_overview": {
             "long_count": len(leaders_tab.get("longs") or []),
             "short_count": len(leaders_tab.get("shorts") or []),
