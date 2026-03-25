@@ -23,6 +23,8 @@ from intraday_boost import calculate_intraday_boost
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 DAILY_BASELINE_REFRESH_SECONDS = int(os.getenv("DAILY_BASELINE_REFRESH_SECONDS", "21600"))
+LOW_RESOURCE_MODE = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+SCANNER_SYMBOL_LIMIT = max(0, int(os.getenv("SCANNER_SYMBOL_LIMIT", "80" if LOW_RESOURCE_MODE else "0")))
 
 _daily_baseline_lock = threading.Lock()
 _daily_baseline_cache: Dict[str, Any] = {
@@ -33,6 +35,13 @@ _daily_baseline_cache: Dict[str, Any] = {
     "is_loading": False,
     "last_attempt": 0.0,
 }
+
+
+def _active_scanner_symbols() -> List[str]:
+    scanner_symbols = list(dict.fromkeys(SCANNER_STOCKS))
+    if SCANNER_SYMBOL_LIMIT > 0:
+        return scanner_symbols[:SCANNER_SYMBOL_LIMIT]
+    return scanner_symbols
 
 
 def _get_sector_index_change_pct(
@@ -141,7 +150,7 @@ def _refresh_daily_baseline_cache(symbols: List[str]) -> None:
             auto_adjust=False,
             group_by="ticker",
             progress=False,
-            threads=True,
+            threads=not LOW_RESOURCE_MODE,
             timeout=20,
         )
         prev_close_by_symbol: Dict[str, float] = {}
@@ -546,8 +555,8 @@ def fetch_all_sectors() -> Dict[str, Any]:
     start = time.time()
 
     # Combined unique symbols: heatmap sectors + scanner universe
-    _combined_symbols = list({sym for sym in ALL_SYMBOLS + SCANNER_STOCKS})
-    scanner_symbols = list(dict.fromkeys(SCANNER_STOCKS))
+    scanner_symbols = _active_scanner_symbols()
+    _combined_symbols = list({sym for sym in ALL_SYMBOLS + scanner_symbols})
     clean_symbols = [s.replace(".NS", "") for s in _combined_symbols]
     scanner_clean_symbols = [s.replace(".NS", "") for s in scanner_symbols]
 
@@ -669,15 +678,15 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     # Build scanner flat list from SCANNER_STOCKS
     scanner_stocks_result: List[Dict[str, Any]] = []
-    for sym in SCANNER_STOCKS:
+    for sym in scanner_symbols:
         clean = sym.replace(".NS", "")
         if clean in heatmap_sym_data:
             scanner_stocks_result.append(heatmap_sym_data[clean])
     scanner_stocks_result.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
-    logger.info(f"Scanner stocks assembled: {len(scanner_stocks_result)}/{len(SCANNER_STOCKS)} symbols.")
+    logger.info(f"Scanner stocks assembled: {len(scanner_stocks_result)}/{len(scanner_symbols)} active symbols.")
 
     scanner_stocks_upstox_result: List[Dict[str, Any]] = []
-    for sym in SCANNER_STOCKS:
+    for sym in scanner_symbols:
         clean = sym.replace(".NS", "")
         if clean in momentum_sym_data:
             scanner_stocks_upstox_result.append(momentum_sym_data[clean])
@@ -685,7 +694,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
     logger.info(
         "Momentum scanner stocks assembled: %d/%d symbols.",
         len(scanner_stocks_upstox_result),
-        len(SCANNER_STOCKS),
+        len(scanner_symbols),
     )
 
     # STEP 4 — Build sector results from sym_data (heatmap only)

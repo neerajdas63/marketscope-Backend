@@ -50,6 +50,13 @@ The API will be available at **http://localhost:8000**.
 | `FO_RADAR_MIN_REFRESH_SECONDS` | `900` | Minimum seconds between automatic F&O Radar refreshes |
 | `ENABLE_OI_ANALYSIS` | `false` | Enable OI analysis endpoints and background OI usage |
 | `ENABLE_FO_RADAR` | `false` | Enable F&O Radar background refresh and endpoints |
+| `LOW_RESOURCE_MODE` | `true` on small instances | Enables conservative defaults for 512MB/1CPU deployments |
+| `SCHEDULER_REFRESH_MINUTES` | `10` | Minutes between background full-market refresh cycles |
+| `FETCH_EXECUTOR_WORKERS` | `1` | Number of background workers allowed for market refresh |
+| `SCANNER_SYMBOL_LIMIT` | `80` | Caps the active scanner universe used in background fetches |
+| `ENABLE_SECTOR_MOMENTUM_SNAPSHOTS` | `false` on small instances | Disable the 9:15–10:00 snapshot cron job |
+| `ENABLE_TRADE_GUARDIAN_MONITOR` | `false` on small instances | Disable continuous Trade Guardian polling job |
+| `ENABLE_OPENING_BACKFILL` | `false` on small instances | Disable startup opening-window backfill work |
 
 ---
 

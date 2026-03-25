@@ -14,16 +14,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from backend.momentum_pulse import schedule_momentum_pulse_refresh
 from fetcher import fetch_all_sectors
 
-# Dedicated thread-pool so fetches never block the async event loop
-_fetch_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mscope-fetch")
-
 if TYPE_CHECKING:
     from cache import InMemoryCache
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
+LOW_RESOURCE_MODE = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 FETCH_TIMEOUT_SECONDS = int(os.getenv("FETCH_TIMEOUT_SECONDS", 240))
+SCHEDULER_REFRESH_MINUTES = max(3, int(os.getenv("SCHEDULER_REFRESH_MINUTES", "10" if LOW_RESOURCE_MODE else "5")))
+FETCH_EXECUTOR_WORKERS = max(1, int(os.getenv("FETCH_EXECUTOR_WORKERS", "1" if LOW_RESOURCE_MODE else "2")))
 ENABLE_FO_RADAR = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+# Dedicated thread-pool so fetches never block the async event loop
+_fetch_executor = ThreadPoolExecutor(max_workers=FETCH_EXECUTOR_WORKERS, thread_name_prefix="mscope-fetch")
 
 
 def _get_momentum_scanner_stocks(data: dict) -> list:
@@ -122,7 +125,7 @@ def start_scheduler(cache_obj: "InMemoryCache") -> AsyncIOScheduler:
     scheduler.add_job(
         scheduled_fetch,
         trigger="interval",
-        minutes=5,
+        minutes=SCHEDULER_REFRESH_MINUTES,
         args=[cache_obj],
         id="market_data_refresh",
         name="MarketScope 5-min data refresh",
@@ -132,5 +135,9 @@ def start_scheduler(cache_obj: "InMemoryCache") -> AsyncIOScheduler:
         misfire_grace_time=60, # allow 60s grace for slow jobs
     )
     scheduler.start()
-    logger.info("Scheduler started — market data will refresh every 5 minutes.")
+    logger.info(
+        "Scheduler started — market data will refresh every %d minutes with %d fetch worker(s).",
+        SCHEDULER_REFRESH_MINUTES,
+        FETCH_EXECUTOR_WORKERS,
+    )
     return scheduler

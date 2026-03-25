@@ -65,10 +65,14 @@ cache: InMemoryCache = InMemoryCache()
 CACHE_DURATION_SECONDS: int = int(os.getenv("CACHE_DURATION_SECONDS", 300))
 INITIAL_CACHE_RETRY_ATTEMPTS: int = int(os.getenv("INITIAL_CACHE_RETRY_ATTEMPTS", 3))
 INITIAL_CACHE_RETRY_DELAY_SECONDS: float = float(os.getenv("INITIAL_CACHE_RETRY_DELAY_SECONDS", 5))
-TRADE_GUARDIAN_POLL_SECONDS: int = max(2, int(os.getenv("TRADE_GUARDIAN_POLL_SECONDS", "10")))
+LOW_RESOURCE_MODE: bool = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+TRADE_GUARDIAN_POLL_SECONDS: int = max(2, int(os.getenv("TRADE_GUARDIAN_POLL_SECONDS", "20" if LOW_RESOURCE_MODE else "10")))
 TRADE_GUARDIAN_STARTUP_DELAY_SECONDS: int = max(0, int(os.getenv("TRADE_GUARDIAN_STARTUP_DELAY_SECONDS", "20")))
 ENABLE_OI_ANALYSIS: bool = str(os.getenv("ENABLE_OI_ANALYSIS", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_FO_RADAR: bool = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SECTOR_MOMENTUM_SNAPSHOTS: bool = str(os.getenv("ENABLE_SECTOR_MOMENTUM_SNAPSHOTS", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_TRADE_GUARDIAN_MONITOR: bool = str(os.getenv("ENABLE_TRADE_GUARDIAN_MONITOR", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_OPENING_BACKFILL: bool = str(os.getenv("ENABLE_OPENING_BACKFILL", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 _trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
 
@@ -132,7 +136,7 @@ def _is_after_open_today() -> bool:
 
 def _should_backfill_opening_window() -> bool:
     """Return True only while the 9:15-10:00 opening backfill window is still relevant."""
-    return _is_momentum_window()
+    return ENABLE_OPENING_BACKFILL and _is_momentum_window()
 
 
 def _momentum_snapshot_job() -> None:
@@ -232,39 +236,45 @@ async def lifespan(app: FastAPI):
     scheduler = start_scheduler(cache)
 
     # Add sector momentum snapshot job — fires exactly at 9:15,9:20,...,9:55 and 10:00 IST
-    _snapshot_trigger = OrTrigger([
-        CronTrigger(day_of_week="mon-fri", hour=9, minute="15,20,25,30,35,40,45,50,55", timezone="Asia/Kolkata"),
-        CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone="Asia/Kolkata"),
-    ])
-    scheduler.add_job(
-        _momentum_snapshot_job,
-        trigger=_snapshot_trigger,
-        id="sector_momentum_snapshot",
-        name="Sector momentum snapshot at slot times",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60,
-    )
-    logger.info("Sector momentum snapshot job registered (cron-aligned).")
+    if ENABLE_SECTOR_MOMENTUM_SNAPSHOTS:
+        _snapshot_trigger = OrTrigger([
+            CronTrigger(day_of_week="mon-fri", hour=9, minute="15,20,25,30,35,40,45,50,55", timezone="Asia/Kolkata"),
+            CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone="Asia/Kolkata"),
+        ])
+        scheduler.add_job(
+            _momentum_snapshot_job,
+            trigger=_snapshot_trigger,
+            id="sector_momentum_snapshot",
+            name="Sector momentum snapshot at slot times",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        logger.info("Sector momentum snapshot job registered (cron-aligned).")
+    else:
+        logger.info("Sector momentum snapshot job disabled by config.")
 
-    scheduler.add_job(
-        _trade_guardian_monitor_job,
-        trigger="interval",
-        seconds=TRADE_GUARDIAN_POLL_SECONDS,
-        id="trade_guardian_monitor",
-        name="Trade Guardian live monitor",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=15,
-        next_run_time=datetime.now() + timedelta(seconds=TRADE_GUARDIAN_STARTUP_DELAY_SECONDS),
-    )
-    logger.info(
-        "Trade Guardian monitor job registered (%ss interval, %ss startup delay).",
-        TRADE_GUARDIAN_POLL_SECONDS,
-        TRADE_GUARDIAN_STARTUP_DELAY_SECONDS,
-    )
+    if ENABLE_TRADE_GUARDIAN_MONITOR:
+        scheduler.add_job(
+            _trade_guardian_monitor_job,
+            trigger="interval",
+            seconds=TRADE_GUARDIAN_POLL_SECONDS,
+            id="trade_guardian_monitor",
+            name="Trade Guardian live monitor",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=15,
+            next_run_time=datetime.now() + timedelta(seconds=TRADE_GUARDIAN_STARTUP_DELAY_SECONDS),
+        )
+        logger.info(
+            "Trade Guardian monitor job registered (%ss interval, %ss startup delay).",
+            TRADE_GUARDIAN_POLL_SECONDS,
+            TRADE_GUARDIAN_STARTUP_DELAY_SECONDS,
+        )
+    else:
+        logger.info("Trade Guardian monitor job disabled by config.")
 
     # Start initial fetch in the background (non-blocking)
     asyncio.create_task(_bg_init_fetch())
