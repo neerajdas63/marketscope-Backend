@@ -26,6 +26,7 @@ _HISTORY_WORKERS = int(os.getenv("UPSTOX_HISTORY_WORKERS", "8"))
 _DAILY_HISTORY_WORKERS = int(os.getenv("UPSTOX_DAILY_HISTORY_WORKERS", "2"))
 _HISTORICAL_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_HISTORICAL_CACHE_TTL_SECONDS", "21600"))
 _INTRADAY_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_INTRADAY_CACHE_TTL_SECONDS", "120"))
+_MINUTE_HISTORY_CHUNK_DAYS = int(os.getenv("UPSTOX_MINUTE_HISTORY_CHUNK_DAYS", "10"))
 
 _client_lock = threading.Lock()
 _client: Optional[httpx.Client] = None
@@ -237,6 +238,91 @@ def _normalize_minute_history_window(from_date: str, to_date: str) -> tuple[str,
     return start.isoformat(), end.isoformat()
 
 
+def _date_range_days(from_date: str, to_date: str) -> int:
+    start = pd.Timestamp(from_date).date()
+    end = pd.Timestamp(to_date).date()
+    if end < start:
+        return 0
+    return (end - start).days + 1
+
+
+def _iter_date_chunks(from_date: str, to_date: str, chunk_days: int) -> List[tuple[str, str]]:
+    start = pd.Timestamp(from_date).date()
+    end = pd.Timestamp(to_date).date()
+    if end < start:
+        return []
+
+    effective_chunk_days = max(1, int(chunk_days))
+    chunks: List[tuple[str, str]] = []
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=effective_chunk_days - 1), end)
+        chunks.append((current.isoformat(), chunk_end.isoformat()))
+        current = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def _concat_history_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    usable = [frame for frame in frames if frame is not None and not frame.empty]
+    if not usable:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    combined = pd.concat(usable, axis=0)
+    if combined.empty:
+        return combined
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return combined
+
+
+def _fetch_minute_history_chunk_frame(
+    instrument_key: str,
+    interval_minutes: int,
+    from_date: str,
+    to_date: str,
+) -> pd.DataFrame:
+    if _date_range_days(from_date, to_date) <= 0:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    try:
+        payload = _request_json(
+            f"/v3/historical-candle/{instrument_key}/minutes/{interval_minutes}/{to_date}/{from_date}",
+            {},
+        )
+        historical_candles = list((payload.get("data") or {}).get("candles") or [])
+        return _candles_to_frame(historical_candles)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 0
+        span_days = _date_range_days(from_date, to_date)
+        if status_code != 400 or span_days <= 1:
+            raise
+
+        start = pd.Timestamp(from_date).date()
+        end = pd.Timestamp(to_date).date()
+        midpoint = start + timedelta(days=(span_days // 2) - 1)
+        if midpoint < start:
+            midpoint = start
+        next_start = midpoint + timedelta(days=1)
+
+        logger.debug(
+            "Upstox minute history request exceeded retrieval limit for %s to %s; splitting into smaller ranges.",
+            from_date,
+            to_date,
+        )
+
+        left_frame = _fetch_minute_history_chunk_frame(
+            instrument_key,
+            interval_minutes,
+            from_date,
+            midpoint.isoformat(),
+        )
+        right_frame = _fetch_minute_history_chunk_frame(
+            instrument_key,
+            interval_minutes,
+            next_start.isoformat(),
+            to_date,
+        )
+        return _concat_history_frames([left_frame, right_frame])
+
+
 def _search_instruments(query: str, exchanges: str, segments: str, records: int = 10) -> List[Dict[str, Any]]:
     if not is_upstox_configured():
         _warn_missing_token_once()
@@ -346,12 +432,21 @@ def _fetch_symbol_history_frame(symbol: str, from_date: str, to_date: str, inter
     historical_key = (normalized, history_from_date, history_to_date, interval_minutes, "historical")
     historical_frame = _get_cached_history(historical_key, _HISTORICAL_CACHE_TTL_SECONDS)
     if historical_frame is None:
-        payload = _request_json(
-            f"/v3/historical-candle/{instrument_key}/minutes/{interval_minutes}/{history_to_date}/{history_from_date}",
-            {},
-        )
-        historical_candles = list((payload.get("data") or {}).get("candles") or [])
-        historical_frame = _candles_to_frame(historical_candles)
+        historical_frames: List[pd.DataFrame] = []
+        for chunk_from_date, chunk_to_date in _iter_date_chunks(
+            history_from_date,
+            history_to_date,
+            _MINUTE_HISTORY_CHUNK_DAYS,
+        ):
+            historical_frames.append(
+                _fetch_minute_history_chunk_frame(
+                    instrument_key,
+                    interval_minutes,
+                    chunk_from_date,
+                    chunk_to_date,
+                )
+            )
+        historical_frame = _concat_history_frames(historical_frames)
         _set_cached_history(historical_key, historical_frame)
 
     intraday_frame = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -371,10 +466,9 @@ def _fetch_symbol_history_frame(symbol: str, from_date: str, to_date: str, inter
                 cached_intraday = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         intraday_frame = cached_intraday
 
-    combined = pd.concat([historical_frame, intraday_frame], axis=0) if not historical_frame.empty or not intraday_frame.empty else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    combined = _concat_history_frames([historical_frame, intraday_frame])
     if combined.empty:
         return combined
-    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     return combined
 
 

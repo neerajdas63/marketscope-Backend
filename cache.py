@@ -32,8 +32,7 @@ class InMemoryCache:
         """Return the last-updated time as an IST-formatted HH:MM:SS string, or 'Never'."""
         if self.updated_at == 0:
             return "Never"
-        utc_dt = datetime.utcfromtimestamp(self.updated_at).replace(
-            tzinfo=pytz.utc
-        )
+        # Use timezone-aware UTC datetime to avoid deprecation warning
+        utc_dt = datetime.fromtimestamp(self.updated_at, datetime.UTC)
         ist_dt = utc_dt.astimezone(IST)
         return ist_dt.strftime("%H:%M:%S")
