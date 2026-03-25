@@ -18,6 +18,7 @@ import yfinance as yf
 from nse_fetcher import fetch_nse_index_quotes
 from runtime_state import load_json_state, save_json_state
 from upstox_client import get_intraday_history_batch, get_underlying_snapshot
+from stocks import SECTORS as _HEATMAP_SECTORS, FO_STOCKS as _FO_STOCKS
 
 logger = logging.getLogger("momentum_pulse")
 
@@ -26,6 +27,13 @@ LOOKBACK_SESSIONS = 20
 MAX_HISTORY_POINTS = 24
 REFRESH_COOLDOWN_SECONDS = 240
 MIN_SESSION_BARS = 1
+TREND_WEIGHT = 0.07
+
+# Reverse mapping: clean symbol → sector name
+_SYMBOL_TO_SECTOR: Dict[str, str] = {}
+for _sect_name, _sect_syms in _HEATMAP_SECTORS.items():
+    for _sym in _sect_syms:
+        _SYMBOL_TO_SECTOR[_sym.replace(".NS", "").upper()] = _sect_name
 
 _DEFAULT_PULSE_CACHE: Dict[str, Any] = {
     "source_key": "",
@@ -400,6 +408,84 @@ def calculate_vwap_alignment(
     return round(vwap, 2), distance_pct, long_score, short_score, is_extended
 
 
+def calculate_volume_consistency(session_df: pd.DataFrame, lookback: int = 6) -> Tuple[float, int, int]:
+    """How many of the last N bars have sustained above-average volume (spike vs real interest)."""
+    recent = session_df.tail(min(lookback, len(session_df))).copy()
+    if len(recent) < 2:
+        return 0.0, 0, len(recent)
+    volumes = pd.Series(recent["Volume"], dtype="float64").fillna(0.0)
+    avg_vol = volumes.mean()
+    if avg_vol <= 0:
+        return 0.0, 0, len(recent)
+    above_avg_count = int((volumes >= avg_vol * 0.8).sum())
+    total_bars = len(volumes)
+    ratio = above_avg_count / total_bars
+    score = _score_from_anchors(ratio, [
+        (0.2, 15.0), (0.4, 35.0), (0.6, 60.0), (0.8, 82.0), (1.0, 100.0),
+    ])
+    return score, above_avg_count, total_bars
+
+
+def calculate_sector_relative_strength(
+    change_pct: float, symbol: str, sector_data: Optional[Dict[str, Any]],
+) -> Tuple[float, float, float, str]:
+    """Compare stock vs its sector. Returns (relative_diff, long_score, short_score, sector_name)."""
+    sector = _SYMBOL_TO_SECTOR.get(symbol.upper().replace(".NS", ""), "")
+    if not sector or not sector_data:
+        return 0.0, 50.0, 50.0, sector
+    sect_info = sector_data.get(sector, {})
+    result = sect_info.get("result", {}) if isinstance(sect_info, dict) else {}
+    sector_change = _safe_float(result.get("current"))
+    relative = round(change_pct - sector_change, 2)
+    long_score = _score_from_anchors(relative, [
+        (-2.0, 10.0), (-0.5, 30.0), (0.0, 45.0), (0.5, 65.0), (1.5, 85.0), (3.0, 100.0),
+    ])
+    short_score = _score_from_anchors(-relative, [
+        (-2.0, 10.0), (-0.5, 30.0), (0.0, 45.0), (0.5, 65.0), (1.5, 85.0), (3.0, 100.0),
+    ])
+    return relative, long_score, short_score, sector
+
+
+def calculate_opening_range_position(
+    session_df: pd.DataFrame, live_price: float,
+) -> Tuple[float, float, float, float, float]:
+    """Position relative to first-15-min opening range. Returns (or_high, or_low, position_pct, long_score, short_score)."""
+    opening_bars = session_df.head(3)
+    if len(opening_bars) < 1 or live_price <= 0:
+        return 0.0, 0.0, 0.0, 50.0, 50.0
+    or_high = _safe_float(opening_bars["High"].max())
+    or_low = _safe_float(opening_bars["Low"].min())
+    if or_high <= or_low or or_high <= 0:
+        return or_high, or_low, 0.0, 50.0, 50.0
+    or_range = or_high - or_low
+    position_pct = round(((live_price - or_low) / or_range) * 100.0, 1)
+    long_score = _score_from_anchors(position_pct, [
+        (-50.0, 10.0), (0.0, 25.0), (50.0, 45.0), (100.0, 68.0), (150.0, 88.0), (200.0, 100.0),
+    ])
+    short_score = _score_from_anchors(position_pct, [
+        (-50.0, 100.0), (0.0, 88.0), (50.0, 55.0), (100.0, 32.0), (150.0, 12.0), (200.0, 5.0),
+    ])
+    return or_high, or_low, position_pct, long_score, short_score
+
+
+def calculate_oi_confirmation(oi_data: Optional[Dict[str, Any]]) -> Tuple[float, float, str]:
+    """OI-based directional confirmation. Returns (long_score, short_score, oi_signal)."""
+    if not oi_data:
+        return 50.0, 50.0, ""
+    oi_signal = str(oi_data.get("oi_signal", ""))
+    oi_change = abs(_safe_float(oi_data.get("oi_change_pct")))
+    oi_bonus = min(oi_change * 3.0, 30.0)
+    if oi_signal == "LONG_BUILDUP":
+        return round(70.0 + oi_bonus, 1), round(max(0.0, 25.0 - oi_bonus * 0.3), 1), oi_signal
+    if oi_signal == "SHORT_COVERING":
+        return 65.0, 35.0, oi_signal
+    if oi_signal == "SHORT_BUILDUP":
+        return round(max(0.0, 25.0 - oi_bonus * 0.3), 1), round(70.0 + oi_bonus, 1), oi_signal
+    if oi_signal == "LONG_UNWINDING":
+        return 35.0, 65.0, oi_signal
+    return 50.0, 50.0, oi_signal
+
+
 def _score_series_metrics(scores: Sequence[float]) -> Dict[str, Any]:
     score_history = [round(_safe_float(value), 1) for value in scores][-MAX_HISTORY_POINTS:]
     n = len(score_history)
@@ -702,6 +788,8 @@ def _evaluate_symbol(
     stock: Dict[str, Any],
     df_5m: Optional[pd.DataFrame],
     nifty_change_pct: float,
+    sector_data: Optional[Dict[str, Any]] = None,
+    oi_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     if df_5m is None or df_5m.empty:
         return None
@@ -757,20 +845,42 @@ def _evaluate_symbol(
         _safe_float(stock.get("vwap")),
     )
 
-    base_long_score = (
-        volume_pace_score * 0.30
-        + range_expansion_score * 0.25
-        + long_rs_score * 0.20
-        + long_consistency * 0.10
-        + long_vwap_score * 0.05
+    # ── New quality components ────────────────────────────────────────────────
+    vol_consistency_score, vol_above_count, vol_total_bars = calculate_volume_consistency(session_df)
+    sector_rel, long_sector_score, short_sector_score, sector_name = calculate_sector_relative_strength(
+        change_pct, str(stock.get("symbol") or ""), sector_data,
     )
-    base_short_score = (
-        volume_pace_score * 0.30
-        + range_expansion_score * 0.25
-        + short_rs_score * 0.20
-        + short_consistency * 0.10
-        + short_vwap_score * 0.05
+    or_high, or_low, or_position_pct, long_or_score, short_or_score = calculate_opening_range_position(
+        session_df, live_price,
     )
+    symbol_clean = str(stock.get("symbol") or "").upper()
+    is_fo = symbol_clean in _FO_STOCKS
+    oi_data = (oi_cache or {}).get(symbol_clean, {}) if is_fo else {}
+    long_oi_score, short_oi_score, oi_signal = calculate_oi_confirmation(oi_data)
+    has_sector = bool(sector_name)
+    has_oi = bool(oi_data) and bool(oi_signal)
+
+    # ── Dynamic weight system (auto-normalizes when OI/sector unavailable) ───
+    long_components = [
+        (volume_pace_score, 22), (vol_consistency_score, 8), (range_expansion_score, 18),
+        (long_rs_score, 12), (long_consistency, 8), (long_vwap_score, 5), (long_or_score, 5),
+    ]
+    short_components = [
+        (volume_pace_score, 22), (vol_consistency_score, 8), (range_expansion_score, 18),
+        (short_rs_score, 12), (short_consistency, 8), (short_vwap_score, 5), (short_or_score, 5),
+    ]
+    if has_sector:
+        long_components.append((long_sector_score, 8))
+        short_components.append((short_sector_score, 8))
+    if has_oi:
+        long_components.append((long_oi_score, 7))
+        short_components.append((short_oi_score, 7))
+    pre_trend_total = 1.0 - TREND_WEIGHT
+    weight_sum = sum(w for _, w in long_components)
+    scale = pre_trend_total / weight_sum if weight_sum > 0 else 0.0
+
+    base_long_score = sum(s * w * scale for s, w in long_components)
+    base_short_score = sum(s * w * scale for s, w in short_components)
     provisional_score = round(max(base_long_score, base_short_score), 1)
     session_key = current_session_date.isoformat()
     bar_key = latest_ts.strftime("%Y-%m-%d %H:%M")
@@ -786,20 +896,12 @@ def _evaluate_symbol(
     score_time_bucket = _time_bucket_for(latest_ts)
 
     long_score = (
-        volume_pace_score * 0.30
-        + range_expansion_score * 0.25
-        + long_rs_score * 0.20
-        + long_consistency * 0.10
-        + long_vwap_score * 0.05
-        + pulse_trend_strength * 0.10
+        base_long_score
+        + pulse_trend_strength * TREND_WEIGHT
     )
     short_score = (
-        volume_pace_score * 0.30
-        + range_expansion_score * 0.25
-        + short_rs_score * 0.20
-        + short_consistency * 0.10
-        + short_vwap_score * 0.05
-        + pulse_trend_strength * 0.10
+        base_short_score
+        + pulse_trend_strength * TREND_WEIGHT
     )
 
     direction, direction_confidence = infer_direction(long_score, short_score)
@@ -828,8 +930,8 @@ def _evaluate_symbol(
     pulse_trend_label = str(committed_trend.get("pulse_trend_label", "Flat"))
     if pulse_trend_label != preview_label:
         score_adjustment, confidence_multiplier = _time_adjustment(score_time_bucket, pulse_trend_label)
-        long_score = round(max(0.0, min(100.0, base_long_score + pulse_trend_strength * 0.10 + score_adjustment)), 1)
-        short_score = round(max(0.0, min(100.0, base_short_score + pulse_trend_strength * 0.10 + score_adjustment)), 1)
+        long_score = round(max(0.0, min(100.0, base_long_score + pulse_trend_strength * TREND_WEIGHT + score_adjustment)), 1)
+        short_score = round(max(0.0, min(100.0, base_short_score + pulse_trend_strength * TREND_WEIGHT + score_adjustment)), 1)
         direction, direction_confidence = infer_direction(long_score, short_score)
         direction_confidence = round(max(0.0, min(100.0, direction_confidence * confidence_multiplier)), 1)
         momentum_pulse_score = round(max(long_score, short_score), 1)
@@ -868,6 +970,48 @@ def _evaluate_symbol(
         warning_flags=warning_flags,
     )
 
+    # ── Momentum Decay Penalty ────────────────────────────────────────────────
+    score_history = committed_trend.get("score_history", [])
+    momentum_decay_pct = 0.0
+    if len(score_history) >= 3:
+        recent_peak = max(score_history[-4:])
+        if recent_peak > 0:
+            momentum_decay_pct = round(((recent_peak - momentum_pulse_score) / recent_peak) * 100.0, 1)
+            if momentum_decay_pct >= 12:
+                penalty = min(momentum_decay_pct * 0.25, 8.0)
+                momentum_pulse_score = round(max(0.0, momentum_pulse_score - penalty), 1)
+                long_score = round(max(0.0, long_score - penalty), 1)
+                short_score = round(max(0.0, short_score - penalty), 1)
+                warning_flags.append("momentum_decay")
+
+    # ── Mean Reversion Flag ───────────────────────────────────────────────────
+    if len(score_history) >= 3:
+        high_count = sum(1 for s in score_history[-4:] if s >= 88)
+        if high_count >= 3:
+            warning_flags.append("overextended_risk")
+
+    # ── Quality Tags ─────────────────────────────────────────────────────────
+    quality_tags: List[str] = []
+    if vol_consistency_score >= 65:
+        quality_tags.append("sustained_volume")
+    if has_sector and sector_rel > 0.5 and direction == "LONG":
+        quality_tags.append("sector_leader")
+    elif has_sector and sector_rel < -0.5 and direction == "SHORT":
+        quality_tags.append("sector_leader")
+    if has_oi and oi_signal in ("LONG_BUILDUP", "SHORT_COVERING") and direction == "LONG":
+        quality_tags.append("oi_confirmed")
+    elif has_oi and oi_signal in ("SHORT_BUILDUP", "LONG_UNWINDING") and direction == "SHORT":
+        quality_tags.append("oi_confirmed")
+    if or_position_pct > 100 and direction == "LONG":
+        quality_tags.append("or_breakout")
+    elif or_position_pct < 0 and direction == "SHORT":
+        quality_tags.append("or_breakout")
+    if volume_pace_ratio >= 1.5 and vol_consistency_score >= 60:
+        quality_tags.append("strong_accumulation")
+
+    # Re-evaluate tier after decay
+    tier = get_tier(momentum_pulse_score)
+
     return {
         "symbol": stock.get("symbol"),
         "ltp": round(live_price, 2),
@@ -875,18 +1019,32 @@ def _evaluate_symbol(
         "direction": direction,
         "direction_confidence": round(direction_confidence, 1),
         "momentum_pulse_score": momentum_pulse_score,
-        "tier": get_tier(momentum_pulse_score),
+        "tier": tier,
         "volume_pace_score": round(volume_pace_score, 1),
         "volume_pace_ratio": round(volume_pace_ratio, 2),
+        "volume_consistency_score": round(vol_consistency_score, 1),
         "range_expansion_score": round(range_expansion_score, 1),
         "range_expansion_ratio": round(range_expansion_ratio, 2),
         "relative_strength": round(relative_strength, 2),
         "long_relative_strength_score": round(long_rs_score, 1),
         "short_relative_strength_score": round(short_rs_score, 1),
+        "sector_name": sector_name,
+        "sector_relative": round(sector_rel, 2),
+        "long_sector_relative_score": round(long_sector_score, 1),
+        "short_sector_relative_score": round(short_sector_score, 1),
         "long_directional_consistency_score": round(long_consistency, 1),
         "short_directional_consistency_score": round(short_consistency, 1),
         "long_vwap_alignment_score": round(long_vwap_score, 1),
         "short_vwap_alignment_score": round(short_vwap_score, 1),
+        "opening_range_high": round(or_high, 2),
+        "opening_range_low": round(or_low, 2),
+        "opening_range_position_pct": round(or_position_pct, 1),
+        "long_opening_range_score": round(long_or_score, 1),
+        "short_opening_range_score": round(short_or_score, 1),
+        "is_fo_stock": is_fo,
+        "oi_signal": oi_signal if is_fo else "",
+        "long_oi_confirmation_score": round(long_oi_score, 1) if has_oi else None,
+        "short_oi_confirmation_score": round(short_oi_score, 1) if has_oi else None,
         "pulse_trend_strength": round(pulse_trend_strength, 1),
         "today_cum_volume": round(today_cum_volume, 1),
         "avg_20d_cum_volume_same_time": round(avg_20d_cum_volume_same_time, 1),
@@ -903,6 +1061,7 @@ def _evaluate_symbol(
         "improving_streak": committed_trend.get("improving_streak", 0),
         "weakening_streak": committed_trend.get("weakening_streak", 0),
         "pulse_trend_label": pulse_trend_label,
+        "momentum_decay_pct": round(momentum_decay_pct, 1),
         "vwap": round(vwap, 2),
         "distance_from_vwap_pct": round(distance_from_vwap_pct, 2),
         "score_time_bucket": behavior_state,
@@ -910,6 +1069,7 @@ def _evaluate_symbol(
         "behavior_state": behavior_state,
         "is_extended": is_extended,
         "warning_flags": warning_flags,
+        "quality_tags": quality_tags,
         "volume_surge": volume_pace_ratio >= 1.5,
         "range_expansion": range_expansion_ratio >= 1.3,
         "index_outperformer": relative_strength >= 0.75 if direction == "LONG" else relative_strength <= -0.75 if direction == "SHORT" else abs(relative_strength) >= 1.0,
@@ -937,6 +1097,23 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
 
     benchmark_change_pct = _nifty_change_from_sources(None)
 
+    # Fetch sector momentum data once for sector-relative scoring
+    sector_data: Optional[Dict[str, Any]] = None
+    try:
+        from sector_momentum import get_momentum_data
+        momentum = get_momentum_data()
+        sector_data = momentum.get("sectors") if momentum else None
+    except Exception as exc:
+        logger.debug("Sector momentum data unavailable for pulse: %s", exc)
+
+    # Fetch cached OI signals once for F&O confirmation scoring
+    oi_cache: Dict[str, Dict[str, Any]] = {}
+    try:
+        from oi_analysis import get_cached_oi_signals
+        oi_cache = get_cached_oi_signals()
+    except Exception as exc:
+        logger.debug("Cached OI signals unavailable for pulse: %s", exc)
+
     results: List[Dict[str, Any]] = []
     stocks_by_symbol = {
         str(stock.get("symbol") or "").strip().upper(): stock
@@ -956,7 +1133,7 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
                 continue
             df_5m = _get_sym_df(raw, symbol_ns)
             try:
-                row = _evaluate_symbol(stock, df_5m, benchmark_change_pct)
+                row = _evaluate_symbol(stock, df_5m, benchmark_change_pct, sector_data=sector_data, oi_cache=oi_cache)
             except Exception as exc:
                 logger.warning("Momentum Pulse failed for %s: %s", clean_symbol, exc)
                 row = None

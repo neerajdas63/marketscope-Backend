@@ -643,3 +643,17 @@ def fo_radar_cache_age_seconds() -> float:
     if _fo_radar_cache_at == 0.0:
         return float("inf")
     return time.monotonic() - _fo_radar_cache_at
+
+
+def get_cached_oi_signals() -> Dict[str, Dict[str, Any]]:
+    """Return symbol -> {oi_signal, oi_change_pct} from cached F&O radar data (no API calls)."""
+    with _fo_radar_lock:
+        signals: Dict[str, Dict[str, Any]] = {}
+        for entry in _fo_radar_cache:
+            sym = str(entry.get("symbol", "")).upper()
+            if sym:
+                signals[sym] = {
+                    "oi_signal": entry.get("oi_signal", ""),
+                    "oi_change_pct": float(entry.get("oi_change_pct", 0) or 0),
+                }
+        return signals
