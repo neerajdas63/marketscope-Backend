@@ -71,7 +71,9 @@ TRADE_GUARDIAN_STARTUP_DELAY_SECONDS: int = max(0, int(os.getenv("TRADE_GUARDIAN
 ENABLE_OI_ANALYSIS: bool = str(os.getenv("ENABLE_OI_ANALYSIS", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_FO_RADAR: bool = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_SECTOR_MOMENTUM_SNAPSHOTS: bool = str(os.getenv("ENABLE_SECTOR_MOMENTUM_SNAPSHOTS", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_TRADE_GUARDIAN_MONITOR: bool = str(os.getenv("ENABLE_TRADE_GUARDIAN_MONITOR", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
+# Disable Trade Guardian monitor by default while feature is turned off temporarily.
+# To re-enable, set the environment variable `ENABLE_TRADE_GUARDIAN_MONITOR` to a truthy value.
+ENABLE_TRADE_GUARDIAN_MONITOR: bool = False
 ENABLE_OPENING_BACKFILL: bool = str(os.getenv("ENABLE_OPENING_BACKFILL", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 _trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
@@ -227,7 +229,10 @@ async def _bg_backfill() -> None:
 async def lifespan(app: FastAPI):
     """Warm the critical cache before reporting the server as ready."""
     logger.info("MarketScope starting...")
-    init_trade_guardian_storage()
+    if ENABLE_TRADE_GUARDIAN_MONITOR:
+        init_trade_guardian_storage()
+    else:
+        logger.info("Trade Guardian disabled by configuration — skipping storage initialization.")
 
     # Give sector_momentum a reference to the cache for EOD fallback snapshots
     momentum_set_cache_ref(cache)
