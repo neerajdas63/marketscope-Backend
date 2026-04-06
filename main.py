@@ -75,6 +75,7 @@ ENABLE_SECTOR_MOMENTUM_SNAPSHOTS: bool = str(os.getenv("ENABLE_SECTOR_MOMENTUM_S
 # To re-enable, set the environment variable `ENABLE_TRADE_GUARDIAN_MONITOR` to a truthy value.
 ENABLE_TRADE_GUARDIAN_MONITOR: bool = False
 ENABLE_OPENING_BACKFILL: bool = str(os.getenv("ENABLE_OPENING_BACKFILL", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_AUTH: bool = str(os.getenv("ENABLE_AUTH", "true") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 _trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
 
@@ -330,6 +331,17 @@ async def access_control_middleware(request: Request, call_next):
 
     path = request.url.path or "/"
     if path in _PUBLIC_PATHS or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES):
+        return await call_next(request)
+
+    if not ENABLE_AUTH:
+        logger.warning("Authentication is disabled; using dummy user for requests.")
+        request.state.current_user = {
+            "id": "dummy",
+            "email": "dummy@example.com",
+            "plan_name": "free",
+            "access_expires_at": None,
+            "notes": "Authentication disabled via ENABLE_AUTH=false"
+        }
         return await call_next(request)
 
     try:
