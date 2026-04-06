@@ -1,0 +1,27 @@
+{
+  "falling_stock": {
+    "setup_stage": "NEUTRAL",
+    "direction": "NEUTRAL",
+    "direction_conf": 2.4,
+    "pre_score": 9.0,
+    "trigger_score": 0.0,
+    "vwap_acceptance": 0.0
+  },
+  "clean_short": {
+    "setup_stage": "EXTENDED",
+    "direction": "SHORT",
+    "direction_conf": 100.0,
+    "pre_score": 35.0,
+    "trigger_score": 35.5,
+    "opportunity_score": 27.9
+  },
+  "extended_breakout": {
+    "setup_stage": "EXTENDED",
+    "direction": "LONG",
+    "direction_conf": 100.0,
+    "trigger_score": 37.2,
+    "opportunity_score": 26.3,
+    "is_chase": true,
+    "chase_reason": "above_breakout_band, far_from_vwap, stale_breakout, vertical_extension"
+  }
+}

@@ -4,3 +4,5 @@ __pycache__/
 venv/
 .DS_Store
 logs/
+upstox_smoke_test.py
+tmp_case*.json
