@@ -15,23 +15,20 @@ class InMemoryCache:
     """Thread-safe in-memory cache with staleness tracking."""
 
     def __init__(self) -> None:
-        # Only restore the timestamp — NOT the full market data.
-        # Loading full market data on startup wastes RAM with stale data
-        # that will be replaced on the first fetch anyway.
         persisted = load_json_state(_CACHE_STATE_FILE, {})
-        self.data: Optional[Any] = None  # always start fresh
+        self.data: Optional[Any] = persisted.get("data")
         self.updated_at: float = float(persisted.get("updated_at") or 0)
 
     def set(self, data: Any) -> None:
         """Store data and record the current timestamp."""
         self.data = data
         self.updated_at = time.time()
-        # Only persist the timestamp — NOT the full market data dict.
-        # Serializing hundreds of stocks on every refresh cycle creates
-        # a second full copy of the data in RAM during JSON serialization.
         save_json_state(
             _CACHE_STATE_FILE,
-            {"updated_at": self.updated_at},
+            {
+                "data": self.data,
+                "updated_at": self.updated_at,
+            },
         )
 
     def get(self) -> Optional[Any]:
@@ -46,6 +43,7 @@ class InMemoryCache:
         """Return the last-updated time as an IST-formatted HH:MM:SS string, or 'Never'."""
         if self.updated_at == 0:
             return "Never"
+        # Use timezone-aware UTC datetime to avoid deprecation warning
         utc_dt = datetime.fromtimestamp(self.updated_at, timezone.utc)
         ist_dt = utc_dt.astimezone(IST)
         return ist_dt.strftime("%H:%M:%S")
