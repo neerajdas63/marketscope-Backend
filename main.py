@@ -71,13 +71,17 @@ TRADE_GUARDIAN_STARTUP_DELAY_SECONDS: int = max(0, int(os.getenv("TRADE_GUARDIAN
 ENABLE_OI_ANALYSIS: bool = str(os.getenv("ENABLE_OI_ANALYSIS", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_FO_RADAR: bool = str(os.getenv("ENABLE_FO_RADAR", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_SECTOR_MOMENTUM_SNAPSHOTS: bool = str(os.getenv("ENABLE_SECTOR_MOMENTUM_SNAPSHOTS", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
-# Disable Trade Guardian monitor by default while feature is turned off temporarily.
-# To re-enable, set the environment variable `ENABLE_TRADE_GUARDIAN_MONITOR` to a truthy value.
 ENABLE_TRADE_GUARDIAN_MONITOR: bool = False
 ENABLE_OPENING_BACKFILL: bool = str(os.getenv("ENABLE_OPENING_BACKFILL", "false" if LOW_RESOURCE_MODE else "true") or "").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_AUTH: bool = str(os.getenv("ENABLE_AUTH", "true") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 _trade_guardian_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trade-guardian")
+
+# ---------------------------------------------------------------------------
+# FIX 1: Module-level executors — never leak, never recreated per-request
+# ---------------------------------------------------------------------------
+_fo_radar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar")
+_fo_radar_init_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar-init")
 
 
 def _get_momentum_scanner_stocks(cached: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -127,8 +131,6 @@ def _is_momentum_window() -> bool:
 
 
 def _is_after_open_today() -> bool:
-    """Return True if it's a weekday and current IST time is at or after 9:15 AM
-    (regardless of whether the opening window has already closed)."""
     import pytz as _pytz
     now = datetime.now(_pytz.timezone("Asia/Kolkata"))
     if now.weekday() > 4:
@@ -138,12 +140,10 @@ def _is_after_open_today() -> bool:
 
 
 def _should_backfill_opening_window() -> bool:
-    """Return True only while the 9:15-10:00 opening backfill window is still relevant."""
     return ENABLE_OPENING_BACKFILL and _is_momentum_window()
 
 
 def _momentum_snapshot_job() -> None:
-    """Scheduled every 5 min; captures a sector momentum snapshot during the open window."""
     if not _is_momentum_window():
         return
     data = cache.get()
@@ -165,7 +165,6 @@ async def _trade_guardian_monitor_job() -> None:
 # ---------------------------------------------------------------------------
 
 async def _bg_init_fetch() -> None:
-    """Run the initial market data fetch before the app reports ready."""
     last_exc: Exception | None = None
     for attempt in range(1, INITIAL_CACHE_RETRY_ATTEMPTS + 1):
         try:
@@ -188,25 +187,22 @@ async def _bg_init_fetch() -> None:
                 raise RuntimeError("Initial cache warm-up failed") from exc
             await asyncio.sleep(INITIAL_CACHE_RETRY_DELAY_SECONDS)
 
-    # Immediately seed the F&O Radar OI cache in its own background thread.
-    # This runs after the initial fetch so stock price data is already available.
     if not ENABLE_FO_RADAR:
         logger.info("[BG] F&O Radar background refresh disabled by config.")
         return
     try:
         from stocks import FO_STOCKS
-        fo_clean          = [s.replace(".NS", "") for s in FO_STOCKS]
-        scanner_stocks    = cache.get().get("scanner_stocks", [])
-        loop              = asyncio.get_running_loop()
-        _radar_ex         = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar-init")
-        loop.run_in_executor(_radar_ex, refresh_fo_radar_cache, fo_clean, scanner_stocks, False)
+        fo_clean       = [s.replace(".NS", "") for s in FO_STOCKS]
+        scanner_stocks = cache.get().get("scanner_stocks", [])
+        loop           = asyncio.get_running_loop()
+        # FIX 1 applied: reuse module-level executor instead of creating a new one
+        loop.run_in_executor(_fo_radar_init_executor, refresh_fo_radar_cache, fo_clean, scanner_stocks, False)
         logger.info("[BG] F&O Radar OI refresh started in background (%d symbols).", len(fo_clean))
     except Exception as exc:
         logger.warning("[BG] Could not start F&O Radar refresh: %s", exc)
 
 
 async def _bg_backfill() -> None:
-    """Backfill opening momentum slots after a post-open server start."""
     if not _should_backfill_opening_window():
         logger.info("[BG] Skipping opening backfill outside the 9:15-10:00 momentum window.")
         return
@@ -228,20 +224,15 @@ async def _bg_backfill() -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm the critical cache before reporting the server as ready."""
     logger.info("MarketScope starting...")
     if ENABLE_TRADE_GUARDIAN_MONITOR:
         init_trade_guardian_storage()
     else:
         logger.info("Trade Guardian disabled by configuration — skipping storage initialization.")
 
-    # Give sector_momentum a reference to the cache for EOD fallback snapshots
     momentum_set_cache_ref(cache)
-
-    # Start the background scheduler
     scheduler = start_scheduler(cache)
 
-    # Add sector momentum snapshot job — fires exactly at 9:15,9:20,...,9:55 and 10:00 IST
     if ENABLE_SECTOR_MOMENTUM_SNAPSHOTS:
         _snapshot_trigger = OrTrigger([
             CronTrigger(day_of_week="mon-fri", hour=9, minute="15,20,25,30,35,40,45,50,55", timezone="Asia/Kolkata"),
@@ -282,10 +273,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Trade Guardian monitor job disabled by config.")
 
-    # Start initial fetch in the background (non-blocking)
     asyncio.create_task(_bg_init_fetch())
 
-    # Catch-up backfill also runs in the background if started after market open.
     if _should_backfill_opening_window():
         logger.info("Server started during opening window — scheduling background backfill...")
         asyncio.create_task(_bg_backfill())
@@ -298,7 +287,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("MarketScope shutting down...")
     scheduler.shutdown(wait=False)
-    logger.info("Scheduler stopped.")
+    # FIX 1: Cleanly shut down module-level executors on app exit
+    _fo_radar_executor.shutdown(wait=False)
+    _fo_radar_init_executor.shutdown(wait=False)
+    _trade_guardian_executor.shutdown(wait=False)
+    logger.info("Scheduler and executors stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +350,6 @@ async def access_control_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 @app.get("/", summary="Welcome", tags=["General"])
 def root() -> Dict[str, Any]:
-    """Welcome endpoint — returns app info and available endpoints."""
     return {
         "app": "MarketScope API",
         "endpoints": ["/heatmap", "/momentum-pulse", "/health"],
@@ -367,19 +359,10 @@ def root() -> Dict[str, Any]:
 
 @app.get("/heatmap", summary="Full sector & stock heatmap data", tags=["Market Data"])
 async def get_heatmap() -> Dict[str, Any]:
-    """
-    Returns the latest sector and stock heatmap data.
-
-    - If the cache is stale (> CACHE_DURATION_SECONDS) AND the market is open,
-      a fresh fetch is triggered synchronously before responding.
-    - If no data is available yet, returns an error with a retry hint.
-    """
-    # If cache is empty or stale, return a warming up/loading response
     data = cache.get()
     if data is None or cache.is_stale(CACHE_DURATION_SECONDS):
         return _warming_up_response(stocks=[], sectors=[], last_updated="", total=0)
 
-    # Ensure market_open reflects the current moment
     response = dict(data)
     response["market_open"] = is_market_hours()
     return response
@@ -392,16 +375,6 @@ async def get_rfactor(
     min_score: float = 0,
     sort_by: str = "rfactor",
 ) -> Dict[str, Any]:
-    """
-    Returns stocks ranked by R-Factor score (composite of volume, price action,
-    RSI, MFI, and relative strength).
-
-    Query params:
-    - limit: number of stocks to return (default 20)
-    - fo_only: filter to F&O eligible stocks only
-    - min_score: minimum R-Factor score threshold
-    - sort_by: rfactor | opportunity | trend
-    """
     return {
         "stocks": [],
         "last_updated": cache.get().get("last_updated", "") if cache.get() else "",
@@ -418,16 +391,6 @@ async def momentum_pulse_endpoint(
     direction: str = "ALL",
     include_veryweak: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Returns live intraday movers ranked by abnormal same-time volume/range activity,
-    relative strength vs Nifty, directional consistency, light VWAP alignment,
-    and score trend improvement.
-
-    Query params:
-    - limit: number of stocks to return (default 40)
-    - direction: ALL | LONG | SHORT
-    - include_veryweak: include veryweak tier names in response
-    """
     cached = cache.get()
     if not cached:
         return _warming_up_response(stocks=[], total=0, last_updated="", direction="ALL")
@@ -586,24 +549,12 @@ async def get_scanner(
     min_volume: float = 0,
     sectors: str = "",
 ) -> Dict[str, Any]:
-    """
-    Filters and tags stocks based on momentum criteria.
-
-    Query params:
-    - min_change: minimum absolute % change (default 1.0)
-    - direction: ALL | GAINERS | LOSERS
-    - fo_only: filter to F&O eligible stocks only
-    - min_volume: minimum volume_ratio threshold
-    - sectors: comma-separated sector names to filter (e.g. "IT,AUTO")
-    """
     cached = cache.get()
     if not cached:
         return _warming_up_response(stocks=[], total=0, last_updated="")
 
-    # Use the scanner_stocks universe (not heatmap sectors)
     all_stocks = list(cached.get("scanner_stocks", []))
 
-    # Apply filters
     if fo_only:
         all_stocks = [s for s in all_stocks if s.get("fo")]
 
@@ -622,7 +573,6 @@ async def get_scanner(
     if min_volume > 0:
         all_stocks = [s for s in all_stocks if s.get("volume_ratio", 0) >= min_volume]
 
-    # Add signal tag
     for stock in all_stocks:
         vol = stock.get("volume_ratio", 0)
         chg = abs(stock.get("change_pct", 0))
@@ -635,7 +585,6 @@ async def get_scanner(
         else:
             stock["signal"] = ""
 
-    # Sort by abs change_pct descending
     all_stocks.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
 
     return {
@@ -652,21 +601,10 @@ async def get_intraday_boost(
     fo_only: bool = False,
     min_score: float = 0,
 ) -> Dict[str, Any]:
-    """
-    Returns stocks ranked by boost_score — a direction-neutral measure of intraday
-    acceleration based on volume burst, price velocity, range position, and candle
-    consistency.
-
-    Query params:
-    - limit: number of stocks to return (default 20)
-    - fo_only: filter to F&O eligible stocks only
-    - min_score: minimum boost_score threshold
-    """
     cached = cache.get()
     if not cached:
         return _warming_up_response(stocks=[], total=0, last_updated="")
 
-    # Use the scanner_stocks universe (not heatmap sectors)
     all_stocks = list(cached.get("scanner_stocks", []))
 
     if fo_only:
@@ -692,9 +630,6 @@ async def get_sequence_strategy_signals(
     signal_type: str = "ALL",
     session_date: str = "",
 ) -> Dict[str, Any]:
-    """
-    Sequence Signals is temporarily disabled to protect core feature stability.
-    """
     return {
         "status": "disabled",
         "message": "Sequence Signals is temporarily disabled to avoid impacting core backend stability.",
@@ -723,30 +658,22 @@ async def get_sector_scope(
     sector: str = "",
     limit: int = 5,
 ) -> Dict[str, Any]:
-    """
-    Returns stocks ranked by scope_score within their sector.
-
-    Query params:
-    - sector: sector name to filter (e.g. "AUTO"). Omit to get top N from every sector.
-    - limit: stocks to return per sector (default 5)
-    """
     cached = cache.get()
     if not cached:
         if sector:
             return _warming_up_response(sector=sector.strip().upper(), stocks=[], total=0, last_updated="")
         return _warming_up_response(sectors=[], last_updated="")
 
-    # Compute scope scores on a shallow copy of the cached sector list
-    import copy
-    sectors_copy = copy.deepcopy(cached["sectors"])
+    # FIX 2: Shallow copy instead of deepcopy — avoids large transient allocations
+    sectors_copy = [
+        {**s, "stocks": [dict(stock) for stock in s.get("stocks", [])]}
+        for s in cached["sectors"]
+    ]
     sectors_copy = calculate_sector_scope(sectors_copy)
 
     if sector:
         target = sector.strip().upper()
-        matched = [
-            s for s in sectors_copy
-            if s["name"].upper() == target
-        ]
+        matched = [s for s in sectors_copy if s["name"].upper() == target]
         if not matched:
             raise HTTPException(status_code=404, detail=f"Sector '{sector}' not found")
         sec = matched[0]
@@ -760,16 +687,12 @@ async def get_sector_scope(
             "last_updated": cached.get("last_updated", ""),
         }
     else:
-        # Top N from each sector
         result = []
         for sec in sectors_copy:
             top_stocks = sorted(
                 sec["stocks"], key=lambda x: x.get("scope_score", 0), reverse=True
             )[:limit]
-            result.append({
-                "sector": sec["name"],
-                "stocks": top_stocks,
-            })
+            result.append({"sector": sec["name"], "stocks": top_stocks})
         return {
             "sectors": result,
             "last_updated": cached.get("last_updated", ""),
@@ -777,7 +700,6 @@ async def get_sector_scope(
 
 
 def get_symbols() -> Dict[str, Any]:
-    """Build a flat sym_data dict from cached sectors (heatmap — deduped by symbol)."""
     cached = cache.get()
     if not cached:
         return {}
@@ -791,7 +713,6 @@ def get_symbols() -> Dict[str, Any]:
 
 
 def get_scanner_symbols() -> Dict[str, Any]:
-    """Build a flat sym_data dict from the scanner_stocks cache (used by scanner/boost/rfactor/planner/fo-radar)."""
     cached = cache.get()
     if not cached:
         return {}
@@ -805,13 +726,6 @@ def get_scanner_symbols() -> Dict[str, Any]:
 
 @app.get("/breakout", summary="Top breakout stocks (52W high, volume, RSI, RS signals)", tags=["Market Data"])
 def breakout_endpoint() -> Dict[str, Any]:
-    """
-    Returns breakout candidates instantly from background cache.
-    First call triggers a background fetch (1-year daily data, parallel).
-    Subsequent calls return cached results immediately.
-
-    Response includes `is_loading: true` while the first scan runs.
-    """
     from breakout_scanner import get_breakout_stocks
     try:
         symbols = get_symbols()
@@ -830,10 +744,6 @@ def breakout_endpoint() -> Dict[str, Any]:
 
 @app.get("/sector-momentum/history", summary="Historical sector momentum for a given date", tags=["Market Data"])
 def sector_momentum_history_endpoint(date: str = None) -> Dict[str, Any]:
-    """
-    Returns reconstructed sector momentum snapshots for a past date.
-    Pass ?date=YYYY-MM-DD; defaults to yesterday when omitted.
-    """
     try:
         from datetime import timedelta
         if not date:
@@ -846,13 +756,6 @@ def sector_momentum_history_endpoint(date: str = None) -> Dict[str, Any]:
 
 @app.get("/sector-momentum", summary="Sector momentum trend tracker (9:15–10:00 AM)", tags=["Market Data"])
 def sector_momentum_endpoint() -> Dict[str, Any]:
-    """
-    Returns sector-wise avg change_pct snapshots taken every 5 minutes
-    from 9:15 AM to 10:00 AM IST.
-
-    Response includes per-sector trend (UP/DOWN/FLAT), momentum score,
-    and top 3 LONG / SHORT sectors.
-    """
     try:
         return get_sector_momentum_data()
     except Exception as exc:
@@ -862,22 +765,11 @@ def sector_momentum_endpoint() -> Dict[str, Any]:
 
 @app.get("/api/morning-watchlist/live", summary="Live morning watchlist (ORB + momentum + volume)", tags=["Market Data"])
 def morning_watchlist_live_endpoint() -> Dict[str, Any]:
-    """
-    Returns today's morning watchlist using live sector momentum.
-    Ranks stocks in the top-3 momentum sectors by ORB breakout, volume ratio,
-    and sector rank score.
-    """
     try:
         return get_live_watchlist()
     except Exception as exc:
         logger.error("Live watchlist endpoint error: %s", exc)
-        return {
-            "error": str(exc),
-            "watchlist": [],
-            "top_long": [],
-            "top_short": [],
-            "top_sectors": [],
-        }
+        return {"error": str(exc), "watchlist": [], "top_long": [], "top_short": [], "top_sectors": []}
 
 
 @app.get("/api/morning-watchlist", summary="Historical morning watchlist for a given date", tags=["Market Data"])
@@ -901,13 +793,7 @@ def morning_watchlist_endpoint(date: str = None) -> Dict[str, Any]:
         return get_morning_watchlist(date)
     except Exception as exc:
         logger.error("Morning watchlist endpoint error: %s", exc)
-        return {
-            "error": str(exc),
-            "watchlist": [],
-            "stocks": [],
-            "top_sectors": [],
-            "date": date or "",
-        }
+        return {"error": str(exc), "watchlist": [], "stocks": [], "top_sectors": [], "date": date or ""}
 
 
 # ---------------------------------------------------------------------------
@@ -917,10 +803,6 @@ def morning_watchlist_endpoint(date: str = None) -> Dict[str, Any]:
 @app.get("/api/oi/bulk", summary="Bulk OI analysis for multiple symbols", tags=["OI Analysis"])
 @app.get("/oi/bulk", include_in_schema=False)
 def oi_bulk_endpoint(symbols: str = "") -> Dict[str, Any]:
-    """
-    Returns OI analysis for multiple F&O symbols.
-    Pass ?symbols=RELIANCE,TCS,NIFTY or leave blank for all F&O stocks.
-    """
     if not ENABLE_OI_ANALYSIS:
         return {
             "status": "disabled",
@@ -933,30 +815,20 @@ def oi_bulk_endpoint(symbols: str = "") -> Dict[str, Any]:
         }
     from stocks import FO_STOCKS
     try:
-        # Frontend may pass the sentinel string "ALL_FO_SYMBOLS" — treat it as empty
         cleaned = symbols.strip()
         if cleaned and cleaned.upper() != "ALL_FO_SYMBOLS":
             sym_list = [s.strip().upper() for s in cleaned.split(",") if s.strip()]
         else:
-            # Use the curated default list (indices + top 30 high-OI stocks)
-            # Fetching all 200+ FO symbols exceeds NSE's rate limit
             from oi_analysis import _DEFAULT_OI_SYMBOLS
             sym_list = _DEFAULT_OI_SYMBOLS
         result = get_bulk_oi(sym_list)
 
-        # Split into nifty/banknifty index summaries and stock list
-        nifty      = result.pop("NIFTY",      result.pop("nifty",      {}))
-        banknifty  = result.pop("BANKNIFTY",  result.pop("banknifty",  {}))
-        stocks     = list(result.values())
-        fetched    = len(stocks) + (1 if nifty else 0) + (1 if banknifty else 0)
+        nifty     = result.pop("NIFTY",     result.pop("nifty",     {}))
+        banknifty = result.pop("BANKNIFTY", result.pop("banknifty", {}))
+        stocks    = list(result.values())
+        fetched   = len(stocks) + (1 if nifty else 0) + (1 if banknifty else 0)
 
-        return {
-            "nifty":      nifty,
-            "banknifty":  banknifty,
-            "stocks":     stocks,
-            "total":      len(sym_list),
-            "fetched":    fetched,
-        }
+        return {"nifty": nifty, "banknifty": banknifty, "stocks": stocks, "total": len(sym_list), "fetched": fetched}
     except Exception as exc:
         logger.error("OI bulk endpoint error: %s", exc)
         return {"data": {}, "count": 0, "error": str(exc)}
@@ -965,7 +837,6 @@ def oi_bulk_endpoint(symbols: str = "") -> Dict[str, Any]:
 @app.get("/api/oi/{symbol}", summary="OI analysis for a single symbol", tags=["OI Analysis"])
 @app.get("/oi/{symbol}", include_in_schema=False)
 def oi_single_endpoint(symbol: str) -> Dict[str, Any]:
-    """Returns OI analysis for a single F&O stock or index (NIFTY/BANKNIFTY)."""
     if not ENABLE_OI_ANALYSIS:
         return {
             "status": "disabled",
@@ -991,25 +862,12 @@ def oi_single_endpoint(symbol: str) -> Dict[str, Any]:
 @app.get("/api/breadth", summary="Market breadth — advances/declines/VWAP stats", tags=["Market Data"])
 @app.get("/breadth", include_in_schema=False)
 def breadth_endpoint() -> Dict[str, Any]:
-    """
-    Returns real-time market breadth computed from cached sector data.
-    No new API calls — instant response.
-    """
     cached = cache.get()
     if not cached:
         return _warming_up_response(
-            advances=0,
-            declines=0,
-            unchanged=0,
-            advance_decline_ratio=0.0,
-            adr=0.0,
-            pct_above_vwap=0.0,
-            pct_positive=0.0,
-            nifty50_breadth=0.0,
-            breadth_signal="WARMING_UP",
-            sector_breadth={},
-            sector_breadth_list=[],
-            total_stocks=0,
+            advances=0, declines=0, unchanged=0, advance_decline_ratio=0.0,
+            adr=0.0, pct_above_vwap=0.0, pct_positive=0.0, nifty50_breadth=0.0,
+            breadth_signal="WARMING_UP", sector_breadth={}, sector_breadth_list=[], total_stocks=0,
         )
     try:
         return get_market_breadth(cached.get("sectors", []))
@@ -1025,19 +883,12 @@ def breadth_endpoint() -> Dict[str, Any]:
 @app.get("/api/sector-relative-strength", summary="Sector strength relative to Nifty50", tags=["Market Data"])
 @app.get("/sector-relative-strength", include_in_schema=False)
 def sector_relative_strength_endpoint() -> Dict[str, Any]:
-    """
-    Returns each sector's change_pct and its performance relative to Nifty50.
-    Classification: OUTPERFORMING (+0.5%), IN LINE, UNDERPERFORMING (-0.5%).
-    """
     cached = cache.get()
     if not cached:
         return _warming_up_response(sectors=[], last_updated="")
     try:
         data = get_relative_sector_strength(cached.get("sectors", []))
-        return {
-            "sectors": data,
-            "last_updated": cached.get("last_updated", ""),
-        }
+        return {"sectors": data, "last_updated": cached.get("last_updated", "")}
     except Exception as exc:
         logger.error("Relative strength endpoint error: %s", exc)
         return {"sectors": {}, "error": str(exc)}
@@ -1050,11 +901,6 @@ def sector_relative_strength_endpoint() -> Dict[str, Any]:
 @app.get("/api/trade-plan/bulk", summary="Trade plans for all F&O stocks", tags=["Trade Planner"])
 @app.get("/trade-plan/bulk", include_in_schema=False)
 def trade_plan_bulk_endpoint(direction: str = "") -> Dict[str, Any]:
-    """
-    Returns actionable trade plans (LONG and SHORT) for all F&O stocks.
-    Optional ?direction=LONG or ?direction=SHORT to filter.
-    Sorted by confidence (HIGH first) then R:R then RFactor descending.
-    """
     sym_data = get_scanner_symbols()
     if not sym_data:
         return _warming_up_response(plans=[], count=0, long_count=0, short_count=0, last_updated="")
@@ -1077,7 +923,6 @@ def trade_plan_bulk_endpoint(direction: str = "") -> Dict[str, Any]:
 @app.get("/api/trade-plan/{symbol}", summary="Trade plan for a single stock", tags=["Trade Planner"])
 @app.get("/trade-plan/{symbol}", include_in_schema=False)
 def trade_plan_single_endpoint(symbol: str) -> Dict[str, Any]:
-    """Returns a trade plan for a single stock symbol."""
     clean = symbol.upper().replace(".NS", "")
     sym_data = get_scanner_symbols()
     if not sym_data:
@@ -1102,10 +947,6 @@ def trade_plan_single_endpoint(symbol: str) -> Dict[str, Any]:
 @app.get("/api/52w-breakouts", summary="52-week high institutional breakout scanner", tags=["Market Data"])
 @app.get("/52w-breakouts", include_in_schema=False)
 def breakouts_52w_endpoint() -> Dict[str, Any]:
-    """
-    Returns stocks within 0.5% of their 52-week high with 2x+ volume surge.
-    Results are cached for 15 minutes. First call triggers background computation.
-    """
     from breakout_scanner import scan_52w_breakouts
     try:
         return scan_52w_breakouts()
@@ -1114,20 +955,34 @@ def breakouts_52w_endpoint() -> Dict[str, Any]:
         return {"results": [], "count": 0, "is_loading": False, "error": str(exc)}
 
 
+# FIX 3: Pre-compute health stats once, cache them — avoid per-request sector loop
+_health_cache: Dict[str, Any] = {}
+_health_cache_ts: float = 0.0
+_HEALTH_CACHE_TTL: float = 30.0  # seconds
+
+
 @app.get("/health", summary="Server health check", tags=["General"])
 def health() -> Dict[str, Any]:
-    """Returns server health information including cache status and stock counts."""
+    """Returns server health — stock counts cached for 30s to reduce per-request work."""
+    import time
+    global _health_cache, _health_cache_ts
+
+    now = time.monotonic()
     data = cache.get()
-    total_sectors = len(data["sectors"]) if data else 0
-    total_stocks = (
-        sum(len(s["stocks"]) for s in data["sectors"]) if data else 0
-    )
+
+    if data and (now - _health_cache_ts) > _HEALTH_CACHE_TTL:
+        _health_cache = {
+            "total_sectors": len(data["sectors"]),
+            "total_stocks": sum(len(s["stocks"]) for s in data["sectors"]),
+        }
+        _health_cache_ts = now
+
     return {
         "status": "ok",
         "last_updated": cache.last_updated_str(),
         "market_open": is_market_hours(),
-        "total_sectors": total_sectors,
-        "total_stocks": total_stocks,
+        "total_sectors": _health_cache.get("total_sectors", 0),
+        "total_stocks": _health_cache.get("total_stocks", 0),
         "trade_guardian_poll_seconds": TRADE_GUARDIAN_POLL_SECONDS,
     }
 
@@ -1239,26 +1094,12 @@ def fo_radar_endpoint(
     min_confidence: int = 1,
     limit: int = 50,
 ) -> Dict[str, Any]:
-    """
-    Returns trade decisions (BUY/SELL/AVOID) for F&O stocks combining OI and
-    price-action signals. Reads from a background cache refreshed every 5 minutes.
-
-    Query params:
-    - signal: ALL | BUY | SELL | AVOID
-    - min_confidence: 1 (Low) | 2 (Medium) | 3 (High)
-    - limit: max stocks to return (default 50)
-    """
     if not ENABLE_FO_RADAR:
         return {
             "status": "disabled",
             "message": "F&O Radar is temporarily disabled to reduce backend load.",
-            "stocks": [],
-            "total": 0,
-            "buy_count": 0,
-            "sell_count": 0,
-            "avoid_count": 0,
-            "last_updated": cache.last_updated_str(),
-            "cache_age_seconds": None,
+            "stocks": [], "total": 0, "buy_count": 0, "sell_count": 0, "avoid_count": 0,
+            "last_updated": cache.last_updated_str(), "cache_age_seconds": None,
         }
     stocks = get_fo_radar_snapshot()
 
@@ -1267,19 +1108,12 @@ def fo_radar_endpoint(
         if not cached:
             return _warming_up_response(
                 message="F&O Radar cache is warming up",
-                stocks=[],
-                total=0,
-                buy_count=0,
-                sell_count=0,
-                avoid_count=0,
-                last_updated=cache.last_updated_str(),
-                cache_age_seconds=None,
+                stocks=[], total=0, buy_count=0, sell_count=0, avoid_count=0,
+                last_updated=cache.last_updated_str(), cache_age_seconds=None,
                 note="OI cache not yet populated — refreshes automatically each cycle.",
             )
-        # Cache exists but radar hasn't run yet — trigger a quick price-action-only snapshot
         try:
             from stocks import FO_STOCKS
-            # Build price-action-only entries from scanner_stocks (not heatmap sectors)
             stock_map: Dict[str, Any] = {}
             for s in cached.get("scanner_stocks", []):
                 sym = s.get("symbol", "")
@@ -1295,17 +1129,11 @@ def fo_radar_endpoint(
         except Exception as exc:
             logger.warning("fo-radar fallback build failed: %s", exc)
             return {
-                "stocks": [],
-                "total": 0,
-                "buy_count": 0,
-                "sell_count": 0,
-                "avoid_count": 0,
-                "last_updated": cache.last_updated_str(),
-                "cache_age_seconds": None,
+                "stocks": [], "total": 0, "buy_count": 0, "sell_count": 0, "avoid_count": 0,
+                "last_updated": cache.last_updated_str(), "cache_age_seconds": None,
                 "note": "OI cache not yet populated — refreshes automatically each cycle.",
             }
 
-    # Apply filters
     sig_upper = signal.upper()
     if sig_upper != "ALL":
         stocks = [s for s in stocks if s["trade_signal"] == sig_upper]
@@ -1329,10 +1157,6 @@ def fo_radar_endpoint(
 
 @app.post("/api/fo-radar/refresh", summary="Trigger a background F&O Radar OI refresh", tags=["OI Analysis"])
 async def fo_radar_refresh_endpoint() -> Dict[str, Any]:
-    """
-    Kick off a background refresh of the F&O Radar OI cache.
-    Returns immediately — the refresh runs in a background thread.
-    """
     if not ENABLE_FO_RADAR:
         return {
             "status": "disabled",
@@ -1344,12 +1168,11 @@ async def fo_radar_refresh_endpoint() -> Dict[str, Any]:
         return _warming_up_response(status="warming_up", symbols=0)
     from stocks import FO_STOCKS
     fo_clean = [s.replace(".NS", "") for s in FO_STOCKS]
-    # Use scanner_stocks for price data (not heatmap sectors)
     scanner_stocks_data = cached.get("scanner_stocks", [])
     loop = asyncio.get_running_loop()
-    _radar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar")
+    # FIX 1 applied: reuse module-level executor — no leak per request
     loop.run_in_executor(
-        _radar_executor,
+        _fo_radar_executor,
         refresh_fo_radar_cache,
         fo_clean,
         scanner_stocks_data,
@@ -1368,5 +1191,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
-        reload=False,  # reload=True causes infinite restart loop on Windows (watchfiles respawns before startup completes)
+        reload=False,
     )
