@@ -22,7 +22,7 @@ _INSTRUMENT_CACHE_TTL_SECONDS = int(os.getenv("UPSTOX_INSTRUMENT_CACHE_TTL_SECON
 _QUOTE_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_QUOTE_CACHE_TTL_SECONDS", "2.0"))
 _CHUNK_SIZE = int(os.getenv("UPSTOX_BATCH_CHUNK_SIZE", "400"))
 _TIMEOUT_SECONDS = float(os.getenv("UPSTOX_TIMEOUT_SECONDS", "15"))
-_HISTORY_WORKERS = int(os.getenv("UPSTOX_HISTORY_WORKERS", "8"))
+_HISTORY_WORKERS = int(os.getenv("UPSTOX_HISTORY_WORKERS", "4"))
 _DAILY_HISTORY_WORKERS = int(os.getenv("UPSTOX_DAILY_HISTORY_WORKERS", "2"))
 _HISTORICAL_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_HISTORICAL_CACHE_TTL_SECONDS", "21600"))
 _INTRADAY_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_INTRADAY_CACHE_TTL_SECONDS", "120"))
@@ -375,12 +375,12 @@ def _get_cached_history(cache_key: tuple[str, str, str, int, str], ttl_seconds: 
         if _is_stale(cached_at, ttl_seconds):
             _history_cache.pop(cache_key, None)
             return None
-        return frame.copy()
+        return frame  # No copy — frames are standalone; callers that mutate always copy themselves
 
 
 def _set_cached_history(cache_key: tuple[str, str, str, int, str], frame: pd.DataFrame) -> None:
     with _history_lock:
-        _history_cache[cache_key] = (time.time(), frame.copy())
+        _history_cache[cache_key] = (time.time(), frame)  # No copy — frame is a fresh standalone DataFrame
 
 
 def _candles_to_frame(candles: List[List[Any]]) -> pd.DataFrame:

@@ -1,3 +1,4 @@
+import gc
 import logging
 import math
 import threading
@@ -134,6 +135,7 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
     try:
         upstox_raw = get_intraday_history_batch(symbols_ns, from_date=from_date, to_date=to_date, interval_minutes=5)
         assembled_frames.update(_collect_frames(upstox_raw, symbols_ns))
+        del upstox_raw  # Free the large intermediate MultiIndex DataFrame before building the final concat
     except Exception as exc:
         logger.warning("Momentum Pulse Upstox historical fetch failed for batch %s: %s", list(symbols_ns), exc)
 
@@ -1139,6 +1141,8 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
                 row = None
             if row:
                 results.append(row)
+        del raw  # Explicitly release the batch DataFrame before loading the next batch
+        gc.collect()
 
     logger.info(
         "Momentum Pulse computed %d names from %d successful batches out of %d.",
