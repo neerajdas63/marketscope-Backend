@@ -91,7 +91,7 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
     import os
     os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
-    from stocks import SECTORS
+    from stocks import ACTIVE_SECTORS
 
     if not top_sector_ranks:
         return {
@@ -116,7 +116,7 @@ def _build_watchlist(date: str, top_sector_ranks: List[Tuple[str, int]]) -> Dict
     top_sectors    = [name for name, _ in top_sector_ranks]
     sector_rank_map = {name: rank for name, rank in top_sector_ranks}
     sector_symbols_map = {
-        sector_name: [s if s.endswith(".NS") else s + ".NS" for s in SECTORS.get(sector_name, [])]
+        sector_name: [s if s.endswith(".NS") else s + ".NS" for s in ACTIVE_SECTORS.get(sector_name, [])]
         for sector_name in top_sectors
     }
     all_symbols_ns = list({symbol for symbols in sector_symbols_map.values() for symbol in symbols})

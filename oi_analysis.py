@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import pytz
 from upstox_client import get_nearest_option_expiry, get_option_chain as get_upstox_option_chain, get_underlying_snapshot, is_upstox_configured
+from stocks import ACTIVE_FO_STOCK_SET
 _IST = pytz.timezone("Asia/Kolkata")
 
 logger = logging.getLogger("oi_analysis")
@@ -32,6 +33,9 @@ _DEFAULT_OI_SYMBOLS = [
     "SUNPHARMA", "ADANIPORTS", "HINDUNILVR", "ONGC", "NTPC", "POWERGRID",
     "BHARTIARTL", "HCLTECH", "TITAN", "MARUTI", "TATASTEEL",
     "BAJAJ-AUTO", "DRREDDY", "CIPLA", "DIVISLAB", "TECHM",
+]
+_DEFAULT_OI_SYMBOLS = _DEFAULT_OI_SYMBOLS[:2] + [
+    symbol for symbol in _DEFAULT_OI_SYMBOLS[2:] if symbol in ACTIVE_FO_STOCK_SET
 ]
 _FO_RADAR_MAX_SYMBOLS = max(10, int(os.getenv("FO_RADAR_MAX_SYMBOLS", "36")))
 _FO_RADAR_MIN_REFRESH_SECONDS = max(60, int(os.getenv("FO_RADAR_MIN_REFRESH_SECONDS", "900")))

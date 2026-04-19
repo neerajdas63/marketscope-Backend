@@ -16,7 +16,7 @@ import yfinance as yf
 
 from angel_client import get_bulk_ltp, get_bulk_full_quotes
 from upstox_client import get_bulk_daily_ohlc, get_bulk_full_quotes as get_upstox_bulk_full_quotes
-from stocks import ALL_SYMBOLS, SECTORS, FO_STOCKS, SCANNER_STOCKS
+from stocks import ACTIVE_FO_STOCK_SET, ACTIVE_SECTORS, ALL_SYMBOLS, SCANNER_STOCKS
 from nse_fetcher import fetch_nse_index_quotes
 from intraday_boost import calculate_intraday_boost
 
@@ -373,7 +373,7 @@ def _build_sym_data(
                     "ltp": ltp_fb,
                     "change_pct": change_fb,
                     "volume_ratio": 1.0,
-                    "fo": clean in FO_STOCKS,
+            "fo": clean in ACTIVE_FO_STOCK_SET,
                     "day_high": ltp_fb,
                     "day_low": ltp_fb,
                     "day_open": ltp_fb,
@@ -411,7 +411,7 @@ def _build_sym_data(
                 "ltp": live_ltp,
                 "change_pct": change_pct,
                 "volume_ratio": vol_ratio,
-                "fo": clean in FO_STOCKS,
+            "fo": clean in ACTIVE_FO_STOCK_SET,
                 "day_high": q.get("day_high", live_ltp or q["ltp"]),
                 "day_low": q.get("day_low", live_ltp or q["ltp"]),
                 "day_open": q.get("day_open", live_ltp or q["ltp"]),
@@ -599,7 +599,7 @@ def fetch_sector(sector_name: str, symbols: List[str]) -> Dict[str, Any]:
 
                 # Strip .NS to check F&O eligibility
                 base_symbol = symbol.replace(".NS", "")
-                fo = base_symbol in FO_STOCKS
+                fo = base_symbol in ACTIVE_FO_STOCK_SET
 
                 stocks_data.append({
                     "symbol": base_symbol,
@@ -818,7 +818,7 @@ def fetch_all_sectors() -> Dict[str, Any]:
 
     # STEP 4 — Build sector results from sym_data (heatmap only)
     sectors_result: List[Dict[str, Any]] = []
-    for sector_name, sector_symbols in SECTORS.items():
+    for sector_name, sector_symbols in ACTIVE_SECTORS.items():
         stocks = []
         for sym in sector_symbols:
             clean = sym.replace(".NS", "")

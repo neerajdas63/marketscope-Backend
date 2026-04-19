@@ -90,9 +90,9 @@ async def scheduled_fetch(cache_obj: "InMemoryCache") -> None:
             logger.info("F&O Radar background refresh disabled by config.")
             return
         try:
-            from stocks import FO_STOCKS
+            from stocks import ACTIVE_FO_STOCKS
             from oi_analysis import refresh_fo_radar_cache
-            fo_clean = [s.replace(".NS", "") for s in FO_STOCKS]
+            fo_clean = list(ACTIVE_FO_STOCKS)
             scanner_stocks = data.get("scanner_stocks", [])
             _radar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fo-radar")
             loop.run_in_executor(_radar_executor, refresh_fo_radar_cache, fo_clean, scanner_stocks, False)

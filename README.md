@@ -53,15 +53,51 @@ The API will be available at **http://localhost:8000**.
 | `LOW_RESOURCE_MODE` | `true` on small instances | Enables conservative defaults for 512MB/1CPU deployments |
 | `ENABLE_SCANNER_BATCH_ROTATION` | `true` on small instances | Rotates scanner fetching batch-wise instead of hitting the full scanner universe every cycle |
 | `SCANNER_BATCH_SIZE` | `80` | Number of scanner symbols refreshed in each rotation batch |
-| `SCANNER_BATCH_INTERVAL_MINUTES` | `3` | Minutes between scanner batch rotations |
-| `SCHEDULER_REFRESH_MINUTES` | `10` | Minutes between background full-market refresh cycles |
+| `SCANNER_BATCH_INTERVAL_MINUTES` | `5` | Minutes between scanner batch rotations in the recommended 512MB / 1 CPU setup |
+| `SCHEDULER_REFRESH_MINUTES` | `5` | Minutes between background full-market refresh cycles in the recommended 512MB / 1 CPU setup |
 | `FETCH_EXECUTOR_WORKERS` | `1` | Number of background workers allowed for market refresh |
 | `SCANNER_SYMBOL_LIMIT` | `0` | Hard cap for scanner universe; keep `0` when using batch rotation so all scanner names eventually rotate through |
-| `ENABLE_SECTOR_MOMENTUM_SNAPSHOTS` | `false` on small instances | Disable the 9:15–10:00 snapshot cron job |
+| `ENABLE_SECTOR_MOMENTUM_SNAPSHOTS` | `true` when Sector Momentum is needed | Keeps the live 9:15–10:00 snapshot cache warm for Sector Momentum |
 | `ENABLE_TRADE_GUARDIAN_MONITOR` | `false` on small instances | Disable continuous Trade Guardian polling job |
 | `ENABLE_OPENING_BACKFILL` | `false` on small instances | Disable startup opening-window backfill work |
+| `MOMENTUM_PULSE_MAX_SYMBOLS` | `90` | Max scanner names evaluated with full intraday history in each Momentum Pulse refresh |
+| `MOMENTUM_PULSE_BATCH_SIZE` | `20` | Symbols processed per Momentum Pulse intraday-history batch |
+| `MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS` | `24` | Calendar days of 5-minute history requested for Momentum Pulse |
+| `MOMENTUM_PULSE_ALLOW_YFINANCE_FALLBACK` | `false` on 512MB / 1 CPU | Disable heavy 5-minute Yahoo fallback in low-resource deployments |
+| `MOMENTUM_PULSE_PERSIST_RESULTS` | `false` on 512MB / 1 CPU | Avoid persisting the full Momentum Pulse result set to runtime state |
+| `MOMENTUM_PULSE_PERSIST_SCORE_STATE` | `true` | Persist short per-symbol score history so trend labels survive restarts |
+| `UPSTOX_HISTORY_CACHE_MAX_ITEMS` | `160` | Caps in-memory Upstox history frames to prevent slow memory creep |
 
 ---
+
+## Recommended Render 512MB Setup
+
+For a 512MB / 1 CPU Render web service that must keep `Momentum Pulse`, `Pulse Navigator`, and `Sector Momentum` alive on a 5-minute cycle:
+
+```env
+LOW_RESOURCE_MODE=true
+SCHEDULER_REFRESH_MINUTES=5
+FETCH_EXECUTOR_WORKERS=1
+ENABLE_SCANNER_BATCH_ROTATION=true
+SCANNER_BATCH_SIZE=80
+SCANNER_BATCH_INTERVAL_MINUTES=5
+ENABLE_SECTOR_MOMENTUM_SNAPSHOTS=true
+ENABLE_OPENING_BACKFILL=false
+MOMENTUM_PULSE_MAX_SYMBOLS=90
+MOMENTUM_PULSE_BATCH_SIZE=20
+MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS=24
+MOMENTUM_PULSE_ALLOW_YFINANCE_FALLBACK=false
+MOMENTUM_PULSE_PERSIST_RESULTS=false
+MOMENTUM_PULSE_PERSIST_SCORE_STATE=true
+UPSTOX_HISTORY_CACHE_MAX_ITEMS=160
+ENABLE_FO_RADAR=false
+ENABLE_OI_ANALYSIS=false
+```
+
+Important:
+
+- Run a single web worker on Render, otherwise each worker will start its own scheduler.
+- `Momentum Pulse` is most stable when `UPSTOX_ACCESS_TOKEN` is configured. On a 512MB instance, disabling the heavy Yahoo fallback is safer than recomputing 5-minute history for the full scanner universe every cycle.
 
 ## API Endpoints
 

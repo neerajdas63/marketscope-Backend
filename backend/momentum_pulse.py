@@ -29,6 +29,20 @@ MAX_HISTORY_POINTS = 24
 REFRESH_COOLDOWN_SECONDS = 240
 MIN_SESSION_BARS = 1
 TREND_WEIGHT = 0.07
+LOW_RESOURCE_MODE = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+MOMENTUM_PULSE_MAX_SYMBOLS = max(0, int(os.getenv("MOMENTUM_PULSE_MAX_SYMBOLS", "90" if LOW_RESOURCE_MODE else "0")))
+MOMENTUM_PULSE_BATCH_SIZE = max(10, int(os.getenv("MOMENTUM_PULSE_BATCH_SIZE", "20" if LOW_RESOURCE_MODE else "30")))
+MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS = max(10, int(os.getenv("MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS", "24" if LOW_RESOURCE_MODE else "30")))
+MOMENTUM_PULSE_ALLOW_YFINANCE_FALLBACK = str(
+    os.getenv("MOMENTUM_PULSE_ALLOW_YFINANCE_FALLBACK", "false" if LOW_RESOURCE_MODE else "true") or ""
+).strip().lower() in {"1", "true", "yes", "on"}
+MOMENTUM_PULSE_PERSIST_RESULTS = str(
+    os.getenv("MOMENTUM_PULSE_PERSIST_RESULTS", "false" if LOW_RESOURCE_MODE else "true") or ""
+).strip().lower() in {"1", "true", "yes", "on"}
+MOMENTUM_PULSE_PERSIST_SCORE_STATE = str(
+    os.getenv("MOMENTUM_PULSE_PERSIST_SCORE_STATE", "true") or ""
+).strip().lower() in {"1", "true", "yes", "on"}
+MOMENTUM_PULSE_PINNED_PREVIOUS_RESULTS = max(0, int(os.getenv("MOMENTUM_PULSE_PINNED_PREVIOUS_RESULTS", "20")))
 
 # Reverse mapping: clean symbol → sector name
 _SYMBOL_TO_SECTOR: Dict[str, str] = {}
@@ -48,11 +62,16 @@ _DEFAULT_PULSE_CACHE: Dict[str, Any] = {
     "error": "",
 }
 _persisted_runtime = load_json_state("momentum_pulse_state.json", {})
+_persisted_pulse_cache = dict(_persisted_runtime.get("pulse_cache") or {})
+if not MOMENTUM_PULSE_PERSIST_RESULTS:
+    _persisted_pulse_cache["results"] = []
 _pulse_cache: Dict[str, Any] = {
     **_DEFAULT_PULSE_CACHE,
-    **dict(_persisted_runtime.get("pulse_cache") or {}),
+    **_persisted_pulse_cache,
 }
-_score_state: Dict[str, Dict[str, Any]] = dict(_persisted_runtime.get("score_state") or {})
+_score_state: Dict[str, Dict[str, Any]] = (
+    dict(_persisted_runtime.get("score_state") or {}) if MOMENTUM_PULSE_PERSIST_SCORE_STATE else {}
+)
 _lock = threading.Lock()
 
 
@@ -66,13 +85,13 @@ def _persist_runtime_state() -> None:
                     "computed_at": _safe_float(_pulse_cache.get("computed_at")),
                     "last_updated": str(_pulse_cache.get("last_updated") or ""),
                     "benchmark_change_pct": _safe_float(_pulse_cache.get("benchmark_change_pct")),
-                    "results": list(_pulse_cache.get("results") or []),
+                    "results": list(_pulse_cache.get("results") or []) if MOMENTUM_PULSE_PERSIST_RESULTS else [],
                     "has_completed": bool(_pulse_cache.get("has_completed")),
                     "is_loading": bool(_pulse_cache.get("is_loading")),
                     "last_attempt": _safe_float(_pulse_cache.get("last_attempt")),
                     "error": str(_pulse_cache.get("error") or ""),
                 },
-                "score_state": _score_state,
+                "score_state": _score_state if MOMENTUM_PULSE_PERSIST_SCORE_STATE else {},
             },
         )
 
@@ -119,7 +138,7 @@ def _chunked(items: Sequence[Any], size: int) -> List[List[Any]]:
 def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame]:
     if not symbols_ns:
         return None
-    from_date = (datetime.now(IST).date() - pd.Timedelta(days=30)).isoformat()
+    from_date = (datetime.now(IST).date() - pd.Timedelta(days=MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS)).isoformat()
     to_date = datetime.now(IST).date().isoformat()
 
     def _collect_frames(raw: Optional[pd.DataFrame], requested_symbols: Sequence[str]) -> Dict[str, pd.DataFrame]:
@@ -140,11 +159,11 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
         logger.warning("Momentum Pulse Upstox historical fetch failed for batch %s: %s", list(symbols_ns), exc)
 
     missing_symbols = [symbol for symbol in symbols_ns if symbol not in assembled_frames]
-    if missing_symbols:
+    if missing_symbols and MOMENTUM_PULSE_ALLOW_YFINANCE_FALLBACK:
         try:
             raw = yf.download(
                 tickers=" ".join(missing_symbols),
-                period="35d",
+                period=f"{MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS + 5}d",
                 interval="5m",
                 auto_adjust=False,
                 group_by="ticker",
@@ -155,10 +174,76 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
             assembled_frames.update(_collect_frames(raw, missing_symbols))
         except Exception as exc:
             logger.warning(f"Momentum Pulse yfinance fallback failed for {missing_symbols}: {exc}")
+    elif missing_symbols:
+        logger.info(
+            "Momentum Pulse skipped yfinance fallback for %d symbols (disabled by config).",
+            len(missing_symbols),
+        )
 
     if not assembled_frames:
         return None
     return pd.concat(assembled_frames, axis=1)
+
+
+def _pulse_candidate_priority(stock: Dict[str, Any]) -> float:
+    change_pct = abs(_safe_float(stock.get("change_pct")))
+    volume_ratio = max(0.0, _safe_float(stock.get("volume_ratio"), 1.0) - 1.0)
+    boost_score = max(0.0, _safe_float(stock.get("boost_score")))
+    data_age_seconds = max(0.0, _safe_float(stock.get("data_age_seconds")))
+    fo_bonus = 2.0 if bool(stock.get("fo")) else 0.0
+    freshness_penalty = min(data_age_seconds / 120.0, 8.0)
+    return round(
+        change_pct * 5.0
+        + volume_ratio * 14.0
+        + boost_score * 1.5
+        + fo_bonus
+        - freshness_penalty,
+        2,
+    )
+
+
+def _select_candidate_scanner_stocks(scanner_stocks: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
+    ordered_symbols: List[str] = []
+    for stock in scanner_stocks:
+        symbol = str(stock.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        if symbol not in deduped:
+            ordered_symbols.append(symbol)
+        deduped[symbol] = stock
+
+    if MOMENTUM_PULSE_MAX_SYMBOLS <= 0 or len(deduped) <= MOMENTUM_PULSE_MAX_SYMBOLS:
+        return [deduped[symbol] for symbol in ordered_symbols]
+
+    ranked_symbols = [
+        symbol
+        for symbol, _score in sorted(
+            ((symbol, _pulse_candidate_priority(stock)) for symbol, stock in deduped.items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+
+    pinned_symbols: List[str] = []
+    if MOMENTUM_PULSE_PINNED_PREVIOUS_RESULTS > 0:
+        snapshot = _snapshot_cache()
+        for row in snapshot.get("results") or []:
+            symbol = str((row or {}).get("symbol") or "").strip().upper()
+            if symbol and symbol in deduped and symbol not in pinned_symbols:
+                pinned_symbols.append(symbol)
+            if len(pinned_symbols) >= MOMENTUM_PULSE_PINNED_PREVIOUS_RESULTS:
+                break
+
+    selected_symbols: List[str] = []
+    for symbol in pinned_symbols + ranked_symbols:
+        if symbol in selected_symbols:
+            continue
+        selected_symbols.append(symbol)
+        if len(selected_symbols) >= MOMENTUM_PULSE_MAX_SYMBOLS:
+            break
+
+    return [deduped[symbol] for symbol in selected_symbols]
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -1085,9 +1170,10 @@ def _evaluate_symbol(
 
 
 def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
+    candidate_stocks = _select_candidate_scanner_stocks(scanner_stocks)
     symbols_ns = []
     seen = set()
-    for stock in scanner_stocks:
+    for stock in candidate_stocks:
         symbol = str(stock.get("symbol") or "").strip().upper()
         if not symbol or symbol in seen:
             continue
@@ -1119,11 +1205,11 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
     results: List[Dict[str, Any]] = []
     stocks_by_symbol = {
         str(stock.get("symbol") or "").strip().upper(): stock
-        for stock in scanner_stocks
+        for stock in candidate_stocks
         if str(stock.get("symbol") or "").strip().upper()
     }
     successful_batches = 0
-    for batch_symbols in _chunked(symbols_ns, 30):
+    for batch_symbols in _chunked(symbols_ns, MOMENTUM_PULSE_BATCH_SIZE):
         raw = _download_intraday_batch(batch_symbols)
         if raw is None or raw.empty:
             continue
@@ -1145,10 +1231,12 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
         gc.collect()
 
     logger.info(
-        "Momentum Pulse computed %d names from %d successful batches out of %d.",
+        "Momentum Pulse computed %d names from %d successful batches out of %d (candidates=%d, source=%d).",
         len(results),
         successful_batches,
-        len(_chunked(symbols_ns, 30)),
+        len(_chunked(symbols_ns, MOMENTUM_PULSE_BATCH_SIZE)),
+        len(candidate_stocks),
+        len(scanner_stocks),
     )
 
     results.sort(

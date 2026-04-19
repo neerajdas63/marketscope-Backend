@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -27,6 +28,7 @@ _DAILY_HISTORY_WORKERS = int(os.getenv("UPSTOX_DAILY_HISTORY_WORKERS", "2"))
 _HISTORICAL_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_HISTORICAL_CACHE_TTL_SECONDS", "21600"))
 _INTRADAY_CACHE_TTL_SECONDS = float(os.getenv("UPSTOX_INTRADAY_CACHE_TTL_SECONDS", "120"))
 _MINUTE_HISTORY_CHUNK_DAYS = int(os.getenv("UPSTOX_MINUTE_HISTORY_CHUNK_DAYS", "10"))
+_HISTORY_CACHE_MAX_ITEMS = max(32, int(os.getenv("UPSTOX_HISTORY_CACHE_MAX_ITEMS", "160")))
 
 _client_lock = threading.Lock()
 _client: Optional[httpx.Client] = None
@@ -46,7 +48,7 @@ _option_lock = threading.Lock()
 _option_expiry_cache: Dict[str, tuple[float, List[str]]] = {}
 
 _history_lock = threading.Lock()
-_history_cache: Dict[tuple[str, str, str, int, str], tuple[float, pd.DataFrame]] = {}
+_history_cache: OrderedDict[tuple[str, str, str, int, str], tuple[float, pd.DataFrame]] = OrderedDict()
 
 _config_warning_lock = threading.Lock()
 _missing_token_warned = False
@@ -375,12 +377,16 @@ def _get_cached_history(cache_key: tuple[str, str, str, int, str], ttl_seconds: 
         if _is_stale(cached_at, ttl_seconds):
             _history_cache.pop(cache_key, None)
             return None
+        _history_cache.move_to_end(cache_key)
         return frame  # No copy — frames are standalone; callers that mutate always copy themselves
 
 
 def _set_cached_history(cache_key: tuple[str, str, str, int, str], frame: pd.DataFrame) -> None:
     with _history_lock:
+        _history_cache.pop(cache_key, None)
         _history_cache[cache_key] = (time.time(), frame)  # No copy — frame is a fresh standalone DataFrame
+        while len(_history_cache) > _HISTORY_CACHE_MAX_ITEMS:
+            _history_cache.popitem(last=False)
 
 
 def _candles_to_frame(candles: List[List[Any]]) -> pd.DataFrame:

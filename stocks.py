@@ -153,6 +153,7 @@ FO_STOCKS = {
 SCANNER_STOCKS = [
     "360ONE.NS",    "ABB.NS",        "APLAPOLLO.NS",  "AUBANK.NS",
     "ADANIENSOL.NS","ADANIENT.NS",   "ADANIGREEN.NS", "ADANIPORTS.NS",
+    "ADANIPOWER.NS",
     "ABCAPITAL.NS", "ALKEM.NS",      "AMBER.NS",      "AMBUJACEM.NS",
     "ANGELONE.NS",  "APOLLOHOSP.NS", "ASHOKLEY.NS",   "ASIANPAINT.NS",
     "ASTRAL.NS",    "AUROPHARMA.NS", "DMART.NS",      "AXISBANK.NS",
@@ -162,16 +163,19 @@ SCANNER_STOCKS = [
     "BPCL.NS",      "BHARTIARTL.NS", "BIOCON.NS",     "BLUESTARCO.NS",
     "BOSCHLTD.NS",  "BRITANNIA.NS",  "CGPOWER.NS",    "CANBK.NS",
     "CDSL.NS",      "CHOLAFIN.NS",   "CIPLA.NS",      "COALINDIA.NS",
-    "COFORGE.NS",   "COLPAL.NS",     "CAMS.NS",       "CONCOR.NS",
+    "COCHINSHIP.NS","COFORGE.NS",    "COLPAL.NS",     "CAMS.NS",
+    "CONCOR.NS",
     "CROMPTON.NS",  "CUMMINSIND.NS", "DLF.NS",        "DABUR.NS",
     "DALBHARAT.NS", "DELHIVERY.NS",  "DIVISLAB.NS",   "DIXON.NS",
     "DRREDDY.NS",   "ETERNAL.NS",    "EICHERMOT.NS",  "EXIDEIND.NS",
-    "NYKAA.NS",     "FORTIS.NS",     "GAIL.NS",       "GMRAIRPORT.NS",
-    "GLENMARK.NS",  "GODREJCP.NS",   "GODREJPROP.NS", "GRASIM.NS",
+    "FORCEMOT.NS",  "NYKAA.NS",      "FORTIS.NS",     "GAIL.NS",
+    "GMRAIRPORT.NS","GLENMARK.NS",   "GODFRYPHLP.NS", "GODREJCP.NS",
+    "GODREJPROP.NS","GRASIM.NS",
     "HCLTECH.NS",   "HDFCAMC.NS",    "HDFCBANK.NS",   "HDFCLIFE.NS",
     "HAVELLS.NS",   "HEROMOTOCO.NS", "HINDALCO.NS",   "HAL.NS",
     "HINDPETRO.NS", "HINDUNILVR.NS", "HINDZINC.NS",   "POWERINDIA.NS",
-    "HUDCO.NS",     "ICICIBANK.NS",  "ICICIGI.NS",    "ICICIPRULI.NS",
+    "HUDCO.NS",     "HYUNDAI.NS",    "ICICIBANK.NS",  "ICICIGI.NS",
+    "ICICIPRULI.NS",
     "IDFCFIRSTB.NS","ITC.NS",        "INDIANB.NS",    "IEX.NS",
     "IOC.NS",       "IRFC.NS",       "IREDA.NS",      "INDUSTOWER.NS",
     "INDUSINDBK.NS","NAUKRI.NS",     "INFY.NS",       "INOXWIND.NS",
@@ -182,10 +186,12 @@ SCANNER_STOCKS = [
     "LAURUSLABS.NS","LICI.NS",       "LODHA.NS",      "LUPIN.NS",
     "M&M.NS",       "MANAPPURAM.NS", "MANKIND.NS",    "MARICO.NS",
     "MARUTI.NS",    "MFSL.NS",       "MAXHEALTH.NS",  "MAZDOCK.NS",
-    "MPHASIS.NS",   "MCX.NS",        "MUTHOOTFIN.NS", "NBCC.NS",
+    "MOTILALOFS.NS","MPHASIS.NS",    "MCX.NS",        "MUTHOOTFIN.NS",
+    "NBCC.NS",
     "NHPC.NS",      "NMDC.NS",       "NTPC.NS",       "NATIONALUM.NS",
-    "NESTLEIND.NS", "NUVAMA.NS",     "OBEROIRLTY.NS", "ONGC.NS",
-    "OIL.NS",       "PAYTM.NS",      "OFSS.NS",       "POLICYBZR.NS",
+    "NESTLEIND.NS", "NAM-INDIA.NS",  "NUVAMA.NS",     "OBEROIRLTY.NS",
+    "ONGC.NS",      "OIL.NS",        "PAYTM.NS",      "OFSS.NS",
+    "POLICYBZR.NS",
     "PGEL.NS",      "PIIND.NS",      "PNBHOUSING.NS", "PAGEIND.NS",
     "PATANJALI.NS", "PERSISTENT.NS", "PETRONET.NS",   "PIDILITIND.NS",
     "PPLPHARMA.NS", "POLYCAB.NS",    "PFC.NS",        "POWERGRID.NS",
@@ -194,18 +200,35 @@ SCANNER_STOCKS = [
     "SBILIFE.NS",   "SHREECEM.NS",   "SRF.NS",        "SAMMAANCAP.NS",
     "MOTHERSON.NS", "SHRIRAMFIN.NS", "SIEMENS.NS",    "SOLARINDS.NS",
     "SONACOMS.NS",  "SBIN.NS",       "SAIL.NS",       "SUNPHARMA.NS",
-    "SUPREMEIND.NS","SUZLON.NS",     "SWIGGY.NS",     "SYNGENE.NS",
-    "TATACONSUM.NS","TVSMOTOR.NS",   "TCS.NS",        "TATAELXSI.NS",
-    "TATAMOTORS.NS","TATAPOWER.NS",  "TATASTEEL.NS",  "TATATECH.NS",
+    "SUPREMEIND.NS","SUZLON.NS",     "SWIGGY.NS",     "TATACONSUM.NS",
+    "TVSMOTOR.NS",  "TCS.NS",        "TATAELXSI.NS",  "TMPV.NS",
+    "TATAPOWER.NS", "TATASTEEL.NS",  "TATATECH.NS",
     "TECHM.NS",     "FEDERALBNK.NS", "INDHOTEL.NS",   "PHOENIXLTD.NS",
     "TITAN.NS",     "TORNTPHARM.NS", "TORNTPOWER.NS", "TRENT.NS",
     "TIINDIA.NS",   "UNOMINDA.NS",   "UPL.NS",        "ULTRACEMCO.NS",
     "UNIONBANK.NS", "UNITDSPR.NS",   "VBL.NS",        "VEDL.NS",
-    "IDEA.NS",      "VOLTAS.NS",     "WAAREEENER.NS", "WIPRO.NS",
+    "VMM.NS",       "IDEA.NS",       "VOLTAS.NS",     "WAAREEENER.NS",
+    "WIPRO.NS",
     "YESBANK.NS",   "ZYDUSLIFE.NS",
 ]
 
-# All unique symbols flat list (deduplicated) — heatmap sectors only
+SCANNER_STOCK_SET = set(SCANNER_STOCKS)
+ACTIVE_FO_STOCKS = [
+    sym.replace(".NS", "")
+    for sym in SCANNER_STOCKS
+    if sym.replace(".NS", "") in FO_STOCKS
+]
+ACTIVE_FO_STOCK_SET = set(ACTIVE_FO_STOCKS)
+
+# Shared backend sector mapping constrained to the active scanner universe.
+ACTIVE_SECTORS = {
+    sector_name: [sym for sym in symbols if sym in SCANNER_STOCK_SET]
+    for sector_name, symbols in SECTORS.items()
+    if any(sym in SCANNER_STOCK_SET for sym in symbols)
+}
+
+# All unique symbols flat list (deduplicated) — only names that are both part
+# of the sector mapping and the active scanner/backend universe.
 ALL_SYMBOLS = list({
-    sym for symbols in SECTORS.values() for sym in symbols
+    sym for symbols in ACTIVE_SECTORS.values() for sym in symbols
 })

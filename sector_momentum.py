@@ -181,7 +181,7 @@ def backfill_today_snapshots() -> None:
     Downloads today's 5-min intraday data via yfinance and fills all elapsed
     time slots so the Opening tracker shows the full picture, not just "--".
     """
-    from stocks import SECTORS
+    from stocks import ACTIVE_SECTORS
     import os
     os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
@@ -207,7 +207,7 @@ def backfill_today_snapshots() -> None:
 
     sector_samples = {
         name: [(s if s.endswith(".NS") else s + ".NS") for s in syms[:5]]
-        for name, syms in SECTORS.items()
+        for name, syms in ACTIVE_SECTORS.items()
     }
     sampled_symbols = list({s for syms in sector_samples.values() for s in syms})
     from_date = (today - timedelta(days=14)).isoformat()
@@ -337,7 +337,7 @@ def backfill_today_snapshots() -> None:
 def get_historical_momentum(target_date: str) -> Dict[str, Any]:
     import yfinance as yf
     from datetime import timedelta
-    from stocks import SECTORS
+    from stocks import ACTIVE_SECTORS
 
     try:
         dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -358,7 +358,7 @@ def get_historical_momentum(target_date: str) -> Dict[str, Any]:
 
     sector_samples = {
         sector_name: [sym if sym.endswith(".NS") else sym + ".NS" for sym in list(symbols)[:5]]
-        for sector_name, symbols in SECTORS.items()
+        for sector_name, symbols in ACTIVE_SECTORS.items()
     }
     sampled_symbols = list({symbol for symbols in sector_samples.values() for symbol in symbols})
     daily_from_date = (dt - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -661,7 +661,7 @@ def get_relative_sector_strength(sectors_data: List[Dict[str, Any]]) -> Dict[str
         }
     """
     try:
-        from stocks import SECTORS as _SECTORS
+        from stocks import ACTIVE_SECTORS as _SECTORS
 
         # Build sym → change_pct map from sectors_data
         sym_change: Dict[str, float] = {}

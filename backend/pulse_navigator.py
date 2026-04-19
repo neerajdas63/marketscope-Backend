@@ -6,7 +6,7 @@ import pytz
 
 from backend.momentum_pulse import get_momentum_pulse
 from runtime_state import load_json_state, save_json_state
-from stocks import SECTORS
+from stocks import ACTIVE_SECTORS
 
 IST = pytz.timezone("Asia/Kolkata")
 DEFAULT_FETCH_LIMIT = 120
@@ -90,7 +90,7 @@ _PRESET_CONFIG: Dict[str, Dict[str, Any]] = {
 
 _SECTOR_BY_SYMBOL = {
     symbol.replace(".NS", ""): sector_name
-    for sector_name, symbols in SECTORS.items()
+    for sector_name, symbols in ACTIVE_SECTORS.items()
     for symbol in symbols
 }
 

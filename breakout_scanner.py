@@ -310,9 +310,9 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
     import os
     os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
     import yfinance as yf
-    from stocks import FO_STOCKS
+    from stocks import ACTIVE_FO_STOCKS
 
-    symbols_ns = [sym + ".NS" for sym in FO_STOCKS]
+    symbols_ns = [sym + ".NS" for sym in ACTIVE_FO_STOCKS]
     logger.info("52W scanner: downloading 1-year daily data for %d symbols.", len(symbols_ns))
 
     from datetime import timedelta
@@ -365,7 +365,7 @@ def _compute_52w_breakouts() -> List[Dict[str, Any]]:
 
     live_quotes: Dict[str, Dict[str, Any]] = {}
     try:
-        live_quotes = get_upstox_bulk_full_quotes(FO_STOCKS)
+        live_quotes = get_upstox_bulk_full_quotes(ACTIVE_FO_STOCKS)
     except Exception as exc:
         logger.warning("52W Upstox live quote fetch failed: %s", exc)
 

@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from backend.auth_access import authorize_request
 from cache import InMemoryCache
 from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
+from backend.momentum_pulse_strategy import build_strategy_payload as build_momentum_pulse_strategy_payload
 from backend.pulse_navigator import get_pulse_navigator, get_pulse_navigator_tab
 from backend.trade_guardian import (
     acknowledge_alert,
@@ -191,8 +192,8 @@ async def _bg_init_fetch() -> None:
         logger.info("[BG] F&O Radar background refresh disabled by config.")
         return
     try:
-        from stocks import FO_STOCKS
-        fo_clean       = [s.replace(".NS", "") for s in FO_STOCKS]
+        from stocks import ACTIVE_FO_STOCKS
+        fo_clean       = list(ACTIVE_FO_STOCKS)
         scanner_stocks = cache.get().get("scanner_stocks", [])
         loop           = asyncio.get_running_loop()
         # FIX 1 applied: reuse module-level executor instead of creating a new one
@@ -407,6 +408,47 @@ async def momentum_pulse_endpoint(
     except Exception as exc:
         logger.error("Momentum Pulse endpoint error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Momentum Pulse computation failed") from exc
+
+
+@app.get("/momentum-pulse/strategy", summary="Trade grading built on Momentum Pulse cache", tags=["Market Data"])
+async def momentum_pulse_strategy_endpoint(
+    limit: int = 40,
+    direction: str = "ALL",
+    grade: str = "ALL",
+    include_veryweak: bool = True,
+) -> Dict[str, Any]:
+    cached = cache.get()
+    if not cached:
+        return _warming_up_response(
+            feature="Momentum Pulse Strategy",
+            feature_key="momentum_pulse_strategy",
+            rows=[],
+            total=0,
+            total_candidates=0,
+            summary={},
+            overall_summary={},
+            direction=direction,
+            grade=grade,
+            include_veryweak=include_veryweak,
+        )
+
+    try:
+        pulse_result = get_momentum_pulse(
+            scanner_stocks=_get_momentum_scanner_stocks(cached),
+            last_updated=str(cached.get("last_updated", "") or ""),
+            direction="ALL",
+            include_veryweak=include_veryweak,
+            limit=max(120, limit * 4),
+        )
+        return build_momentum_pulse_strategy_payload(
+            pulse_result=pulse_result,
+            direction=direction,
+            grade=grade,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Momentum Pulse Strategy endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Momentum Pulse Strategy computation failed") from exc
 
 
 @app.get("/pulse-navigator", summary="Curated discovery upgrade built on Momentum Pulse", tags=["Market Data"])
@@ -813,7 +855,7 @@ def oi_bulk_endpoint(symbols: str = "") -> Dict[str, Any]:
             "nifty": {},
             "banknifty": {},
         }
-    from stocks import FO_STOCKS
+    from stocks import ACTIVE_FO_STOCKS
     try:
         cleaned = symbols.strip()
         if cleaned and cleaned.upper() != "ALL_FO_SYMBOLS":
@@ -1113,14 +1155,14 @@ def fo_radar_endpoint(
                 note="OI cache not yet populated — refreshes automatically each cycle.",
             )
         try:
-            from stocks import FO_STOCKS
+            from stocks import ACTIVE_FO_STOCKS
             stock_map: Dict[str, Any] = {}
             for s in cached.get("scanner_stocks", []):
                 sym = s.get("symbol", "")
                 if sym:
                     stock_map[sym] = s
             from oi_analysis import compute_fo_trade_signal
-            clean_fo = [s.replace(".NS", "") for s in FO_STOCKS]
+            clean_fo = list(ACTIVE_FO_STOCKS)
             stocks = [
                 compute_fo_trade_signal({}, stock_map[sym])
                 for sym in clean_fo if sym in stock_map
@@ -1166,8 +1208,8 @@ async def fo_radar_refresh_endpoint() -> Dict[str, Any]:
     cached = cache.get()
     if not cached:
         return _warming_up_response(status="warming_up", symbols=0)
-    from stocks import FO_STOCKS
-    fo_clean = [s.replace(".NS", "") for s in FO_STOCKS]
+    from stocks import ACTIVE_FO_STOCKS
+    fo_clean = list(ACTIVE_FO_STOCKS)
     scanner_stocks_data = cached.get("scanner_stocks", [])
     loop = asyncio.get_running_loop()
     # FIX 1 applied: reuse module-level executor — no leak per request

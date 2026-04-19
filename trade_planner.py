@@ -240,11 +240,11 @@ def get_bulk_trade_plans(sym_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     Generate trade plans for all F&O stocks in sym_data.
     Returns both LONG and SHORT plans sorted by confidence → R:R → rfactor.
     """
-    from stocks import FO_STOCKS
+    from stocks import ACTIVE_FO_STOCK_SET
 
     plans: List[Dict[str, Any]] = []
     for sym, stock in sym_data.items():
-        if sym not in FO_STOCKS:
+        if sym not in ACTIVE_FO_STOCK_SET:
             continue
         plan = get_trade_plan(sym, stock)
         if plan:
