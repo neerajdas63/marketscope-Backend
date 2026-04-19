@@ -19,7 +19,10 @@ from pydantic import BaseModel, Field
 from backend.auth_access import authorize_request
 from cache import InMemoryCache
 from backend.momentum_pulse import get_momentum_pulse, schedule_momentum_pulse_refresh
-from backend.momentum_pulse_strategy import build_strategy_payload as build_momentum_pulse_strategy_payload
+from backend.momentum_pulse_strategy import (
+    build_historical_strategy_payload as build_historical_momentum_pulse_strategy_payload,
+    build_strategy_payload as build_momentum_pulse_strategy_payload,
+)
 from backend.pulse_navigator import get_pulse_navigator, get_pulse_navigator_tab
 from backend.trade_guardian import (
     acknowledge_alert,
@@ -416,7 +419,24 @@ async def momentum_pulse_strategy_endpoint(
     direction: str = "ALL",
     grade: str = "ALL",
     include_veryweak: bool = True,
+    date: str = "",
 ) -> Dict[str, Any]:
+    if date:
+        try:
+            return build_historical_momentum_pulse_strategy_payload(
+                target_date=date,
+                direction=direction,
+                grade=grade,
+                limit=limit,
+                include_veryweak=include_veryweak,
+                scanner_symbols=_get_momentum_scanner_stocks(cache.get() or {}),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Momentum Pulse Strategy historical endpoint error: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail="Momentum Pulse Strategy historical replay failed") from exc
+
     cached = cache.get()
     if not cached:
         return _warming_up_response(

@@ -135,11 +135,13 @@ def _chunked(items: Sequence[Any], size: int) -> List[List[Any]]:
     return [list(items[index:index + size]) for index in range(0, len(items), size)]
 
 
-def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame]:
+def _download_intraday_batch_for_range(
+    symbols_ns: Sequence[str],
+    from_date: str,
+    to_date: str,
+) -> Optional[pd.DataFrame]:
     if not symbols_ns:
         return None
-    from_date = (datetime.now(IST).date() - pd.Timedelta(days=MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS)).isoformat()
-    to_date = datetime.now(IST).date().isoformat()
 
     def _collect_frames(raw: Optional[pd.DataFrame], requested_symbols: Sequence[str]) -> Dict[str, pd.DataFrame]:
         frames: Dict[str, pd.DataFrame] = {}
@@ -160,10 +162,12 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
 
     missing_symbols = [symbol for symbol in symbols_ns if symbol not in assembled_frames]
     if missing_symbols and MOMENTUM_PULSE_ALLOW_YFINANCE_FALLBACK:
+        end_exclusive = (pd.Timestamp(to_date) + pd.Timedelta(days=1)).date().isoformat()
         try:
             raw = yf.download(
                 tickers=" ".join(missing_symbols),
-                period=f"{MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS + 5}d",
+                start=from_date,
+                end=end_exclusive,
                 interval="5m",
                 auto_adjust=False,
                 group_by="ticker",
@@ -183,6 +187,14 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
     if not assembled_frames:
         return None
     return pd.concat(assembled_frames, axis=1)
+
+
+def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame]:
+    if not symbols_ns:
+        return None
+    from_date = (datetime.now(IST).date() - pd.Timedelta(days=MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS)).isoformat()
+    to_date = datetime.now(IST).date().isoformat()
+    return _download_intraday_batch_for_range(symbols_ns, from_date=from_date, to_date=to_date)
 
 
 def _pulse_candidate_priority(stock: Dict[str, Any]) -> float:
@@ -666,9 +678,28 @@ def calculate_pulse_trend(
     bar_key: str,
     session_key: str,
     commit: bool,
+    state_store: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    with _lock:
-        state = _score_state.setdefault(symbol, {"session_key": session_key, "points": []})
+    store = state_store if state_store is not None else _score_state
+
+    if state_store is None:
+        with _lock:
+            state = store.setdefault(symbol, {"session_key": session_key, "points": []})
+            if state.get("session_key") != session_key:
+                state["session_key"] = session_key
+                state["points"] = []
+
+            points = [dict(point) for point in state.get("points", [])]
+            if points and points[-1].get("bar_key") == bar_key:
+                points[-1]["score"] = round(current_score, 1)
+            else:
+                points.append({"bar_key": bar_key, "score": round(current_score, 1)})
+            points = points[-MAX_HISTORY_POINTS:]
+
+            if commit:
+                state["points"] = points
+    else:
+        state = store.setdefault(symbol, {"session_key": session_key, "points": []})
         if state.get("session_key") != session_key:
             state["session_key"] = session_key
             state["points"] = []
@@ -877,6 +908,7 @@ def _evaluate_symbol(
     nifty_change_pct: float,
     sector_data: Optional[Dict[str, Any]] = None,
     oi_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    trend_state: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     if df_5m is None or df_5m.empty:
         return None
@@ -977,6 +1009,7 @@ def _evaluate_symbol(
         bar_key,
         session_key,
         commit=False,
+        state_store=trend_state,
     )
 
     pulse_trend_strength = _safe_float(provisional_trend.get("pulse_trend_strength"))
@@ -1012,6 +1045,7 @@ def _evaluate_symbol(
         bar_key,
         session_key,
         commit=True,
+        state_store=trend_state,
     )
     pulse_trend_strength = _safe_float(committed_trend.get("pulse_trend_strength"))
     pulse_trend_label = str(committed_trend.get("pulse_trend_label", "Flat"))
@@ -1028,6 +1062,7 @@ def _evaluate_symbol(
             bar_key,
             session_key,
             commit=True,
+            state_store=trend_state,
         )
         pulse_trend_strength = _safe_float(committed_trend.get("pulse_trend_strength"))
         pulse_trend_label = str(committed_trend.get("pulse_trend_label", "Flat"))
