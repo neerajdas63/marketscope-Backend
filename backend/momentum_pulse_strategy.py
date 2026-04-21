@@ -1,29 +1,25 @@
 from __future__ import annotations
 
-from datetime import date as calendar_date, datetime, time, timedelta
+import threading
+from datetime import datetime, time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import pandas as pd
 import pytz
 
-from backend.momentum_pulse import (
-    LOOKBACK_SESSIONS,
-    MOMENTUM_PULSE_BATCH_SIZE,
-    _SYMBOL_TO_SECTOR,
-    _download_intraday_batch_for_range,
-    _evaluate_symbol,
-    _get_sym_df,
-    _split_sessions,
-)
-from stocks import SCANNER_STOCKS
-
 IST = pytz.timezone("Asia/Kolkata")
+
+# Strategy entry validity window (IST).
 ENTRY_WINDOW_START = time(9, 35)
 ENTRY_WINDOW_END_EXCLUSIVE = time(11, 0)
+
 _VALID_DIRECTION_FILTERS = {"ALL", "LONG", "SHORT"}
 _VALID_GRADE_FILTERS = {"ALL", "A_PLUS", "A", "FAILED_OR_CHOP", "NO_TRADE"}
 _ACTIONABLE_GRADES = {"A_PLUS", "A"}
-_HISTORICAL_LOOKBACK_CALENDAR_DAYS = max(35, LOOKBACK_SESSIONS + 10)
+
+# Rolling live-grade state: symbol -> {"trade_date": "YYYY-MM-DD", "grades": [...], "last_scan_time": "HH:MM"}
+_GRADE_STATE_LOCK = threading.Lock()
+_GRADE_STATE: Dict[str, Dict[str, Any]] = {}
+_GRADE_HISTORY_MAX = 6
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -108,8 +104,30 @@ def _get_directional_scores(row: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def _normalize_direction_filter(value: str) -> str:
+    normalized = _safe_str(value, "ALL").upper()
+    return normalized if normalized in _VALID_DIRECTION_FILTERS else "ALL"
+
+
+def _normalize_grade_filter(value: str) -> str:
+    normalized = _safe_str(value, "ALL").upper()
+    return normalized if normalized in _VALID_GRADE_FILTERS else "ALL"
+
+
+def _extract_warning_flags(row: Dict[str, Any]) -> List[str]:
+    raw = row.get("warning_flags", row.get("warningflags", []))
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",")]
+        return [p for p in parts if p]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(flag).strip() for flag in raw if str(flag).strip()]
+    return []
+
+
 def _major_risk_flags(row: Dict[str, Any]) -> List[str]:
-    warning_flags = list(row.get("warningflags", row.get("warning_flags", [])) or [])
+    warning_flags = _extract_warning_flags(row)
     risks: List[str] = []
 
     if _has_text_item(warning_flags, "farfromvwap") or _has_text_item(warning_flags, "far_from_vwap"):
@@ -330,6 +348,8 @@ def build_entry_stop_exit(row: Dict[str, Any], classified: Dict[str, Any]) -> Di
             "stop_loss": None,
             "target_1": None,
             "target_2": None,
+            "rr_t1": None,
+            "rr_t2": None,
             "entry_notes": ["No clean trade / failed setup / chop risk"],
             "stop_notes": ["Avoid forced entry"],
             "exit_notes": ["Wait for cleaner setup"],
@@ -343,10 +363,7 @@ def build_entry_stop_exit(row: Dict[str, Any], classified: Dict[str, Any]) -> Di
 
         entry_notes.append("Direct entry: breakout candle close above OR high")
         entry_notes.append("Safer entry: OR high / VWAP retest hold after breakout")
-        if grade == "A_PLUS":
-            entry_notes.append("A+ trade: early aggressive sizing possible if breakout body strong ho")
-        else:
-            entry_notes.append("A trade: better to wait for confirmation or small retest")
+        entry_notes.append("A+ trade: early aggressive sizing possible if breakout body strong ho" if grade == "A_PLUS" else "A trade: better to wait for confirmation or small retest")
 
         stop_notes.append("Primary stop: OR high retest zone ke neeche")
         stop_notes.append("Alternate stop: VWAP ke neeche 5-minute close")
@@ -363,10 +380,7 @@ def build_entry_stop_exit(row: Dict[str, Any], classified: Dict[str, Any]) -> Di
 
         entry_notes.append("Direct entry: breakdown candle close below OR low")
         entry_notes.append("Safer entry: OR low / VWAP retest reject after breakdown")
-        if grade == "A_PLUS":
-            entry_notes.append("A+ trade: aggressive short possible if selling pressure real ho")
-        else:
-            entry_notes.append("A trade: confirmation ke baad short lena better")
+        entry_notes.append("A+ trade: aggressive short possible if selling pressure real ho" if grade == "A_PLUS" else "A trade: confirmation ke baad short lena better")
 
         stop_notes.append("Primary stop: OR low rejection zone ke upar")
         stop_notes.append("Alternate stop: VWAP reclaim ke upar 5-minute close")
@@ -391,95 +405,6 @@ def build_entry_stop_exit(row: Dict[str, Any], classified: Dict[str, Any]) -> Di
     }
 
 
-def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    classified = classify_trade(row)
-    plan = build_entry_stop_exit(row, classified)
-
-    result = dict(row)
-    result.update(classified)
-    result.update(plan)
-
-    result["scan_time"] = _safe_str(row.get("scan_time"))
-    result["symbol"] = _safe_str(row.get("symbol"))
-    result["trade_date"] = _safe_str(row.get("trade_date"))
-    result["price_at_scan"] = _round_price(row.get("price_at_scan", row.get("ltp")))
-    result["prev_close"] = _round_price(row.get("prev_close"))
-    result["vwap"] = _round_price(row.get("vwap"))
-    result["or_high"] = _round_price(row.get("or_high", row.get("opening_range_high")))
-    result["or_low"] = _round_price(row.get("or_low", row.get("opening_range_low")))
-    result["vwap_distance_pct"] = round(_safe_float(row.get("vwap_distance_pct", row.get("distance_from_vwap_pct"))), 2)
-    result["volume_ratio"] = round(_safe_float(row.get("volume_ratio", row.get("volume_pace_ratio", row.get("volumepaceratio")))), 2)
-    result["range_ratio"] = round(_safe_float(row.get("range_ratio", row.get("range_expansion_ratio", row.get("rangeexpansionratio")))), 2)
-
-    return result
-
-
-def build_strategy_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return _sort_strategy_rows([build_strategy_row(row) for row in (rows or [])])
-
-
-def _sort_strategy_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    output = list(rows or [])
-    grade_priority = {
-        "A_PLUS": 4,
-        "A": 3,
-        "FAILED_OR_CHOP": 2,
-        "NO_TRADE": 1,
-    }
-    output.sort(
-        key=lambda x: (
-            grade_priority.get(_safe_str(x.get("grade")).upper(), 0),
-            _safe_float(x.get("score")),
-            _safe_float(x.get("volume_ratio")),
-            _safe_float(x.get("range_ratio")),
-        ),
-        reverse=True,
-    )
-    return output
-
-
-def summarize_strategy(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    rows = list(rows or [])
-    a_plus = [r for r in rows if _safe_str(r.get("grade")).upper() == "A_PLUS"]
-    a_only = [r for r in rows if _safe_str(r.get("grade")).upper() == "A"]
-    failed = [r for r in rows if _safe_str(r.get("grade")).upper() == "FAILED_OR_CHOP"]
-    no_trade = [r for r in rows if _safe_str(r.get("grade")).upper() == "NO_TRADE"]
-    longs = [r for r in rows if _safe_str(r.get("trade_side")).upper() == "LONG"]
-    shorts = [r for r in rows if _safe_str(r.get("trade_side")).upper() == "SHORT"]
-
-    def avg(items: Sequence[Dict[str, Any]], key: str) -> float:
-        vals = [_safe_float(i.get(key)) for i in items if i.get(key) is not None]
-        return round(sum(vals) / len(vals), 2) if vals else 0.0
-
-    return {
-        "total": len(rows),
-        "a_plus_count": len(a_plus),
-        "a_count": len(a_only),
-        "failed_or_chop_count": len(failed),
-        "no_trade_count": len(no_trade),
-        "long_count": len(longs),
-        "short_count": len(shorts),
-        "avg_volume_ratio": avg(rows, "volume_ratio"),
-        "avg_range_ratio": avg(rows, "range_ratio"),
-        "avg_abs_change_pct": round(
-            sum(abs(_safe_float(r.get("change_pct_at_scan", r.get("changepct", r.get("change_pct"))))) for r in rows) / len(rows),
-            2
-        ) if rows else 0.0,
-        "a_plus_common": {
-            "avg_score": avg(a_plus, "score"),
-            "avg_vwap_dist": avg(a_plus, "vwap_distance_pct"),
-            "avg_volume_ratio": avg(a_plus, "volume_ratio"),
-            "avg_range_ratio": avg(a_plus, "range_ratio"),
-        },
-        "a_common": {
-            "avg_score": avg(a_only, "score"),
-            "avg_vwap_dist": avg(a_only, "vwap_distance_pct"),
-            "avg_volume_ratio": avg(a_only, "volume_ratio"),
-            "avg_range_ratio": avg(a_only, "range_ratio"),
-        },
-    }
-
-
 def _infer_prev_close_from_pulse_row(row: Dict[str, Any]) -> float:
     direct = _safe_float(row.get("prev_close"))
     if direct > 0:
@@ -497,7 +422,7 @@ def _derive_rank_grade(row: Dict[str, Any]) -> int:
     score = _safe_float(row.get("momentum_pulse_score"))
     rank = max(1, _safe_int(row.get("rank"), 9999))
     tier = _safe_str(row.get("tier")).lower()
-    volume_ratio = _safe_float(row.get("volume_pace_ratio"))
+    volume_ratio = _safe_float(row.get("volume_pace_ratio", row.get("volume_ratio")))
     trend_strength = _safe_float(row.get("pulse_trend_strength"))
 
     if score >= 72 and rank <= 12 and tier == "strong" and volume_ratio >= 1.2:
@@ -528,7 +453,7 @@ def _seed_reasons_from_pulse_row(row: Dict[str, Any]) -> List[str]:
     volume_ratio = _safe_float(row.get("volume_pace_ratio"))
     range_ratio = _safe_float(row.get("range_expansion_ratio"))
     behavior_state = _safe_str(row.get("behavior_state")).upper()
-    warning_flags = [str(flag).strip().lower() for flag in (row.get("warning_flags") or [])]
+    warning_flags = [str(flag).strip().lower() for flag in _extract_warning_flags(row)]
     quality_tags = [str(tag).strip().lower() for tag in (row.get("quality_tags") or [])]
 
     if direction not in {"LONG", "SHORT"} or direction_confidence < 12:
@@ -554,7 +479,7 @@ def _prepare_strategy_input_row(row: Dict[str, Any], trade_date: str) -> Dict[st
         {
             "scan_time": _safe_str(row.get("latest_bar_time", row.get("scan_time"))),
             "trade_date": trade_date,
-            "price_at_scan": _safe_float(row.get("ltp")),
+            "price_at_scan": _safe_float(row.get("ltp", row.get("price_at_scan"))),
             "prev_close": _infer_prev_close_from_pulse_row(row),
             "or_high": _safe_float(row.get("opening_range_high", row.get("or_high"))),
             "or_low": _safe_float(row.get("opening_range_low", row.get("or_low"))),
@@ -571,14 +496,382 @@ def _prepare_strategy_input_row(row: Dict[str, Any], trade_date: str) -> Dict[st
     return prepared
 
 
-def _normalize_direction_filter(value: str) -> str:
-    normalized = _safe_str(value, "ALL").upper()
-    return normalized if normalized in _VALID_DIRECTION_FILTERS else "ALL"
+def _grade_value(grade: str) -> int:
+    value = _safe_str(grade).upper()
+    return {"A_PLUS": 4, "A": 3, "FAILED_OR_CHOP": 2, "NO_TRADE": 1}.get(value, 0)
 
 
-def _normalize_grade_filter(value: str) -> str:
-    normalized = _safe_str(value, "ALL").upper()
-    return normalized if normalized in _VALID_GRADE_FILTERS else "ALL"
+def _grade_stability_score(history: Sequence[str]) -> float:
+    grades = [str(g).upper() for g in (history or []) if str(g).strip()]
+    if not grades:
+        return 0.0
+
+    values = [_grade_value(g) for g in grades]
+    n = len(values)
+    latest = values[-1]
+    avg_val = sum(values) / max(n, 1)
+    flips = sum(1 for i in range(1, n) if grades[i] != grades[i - 1])
+    actionable_ratio = sum(1 for g in grades if g in _ACTIONABLE_GRADES) / max(n, 1)
+
+    score = (avg_val / 4.0) * 55.0 + (latest / 4.0) * 25.0 + actionable_ratio * 15.0 - flips * 10.0
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _update_grade_state(symbol: str, trade_date: str, grade: str, scan_time_value: Any) -> List[str]:
+    symbol_key = _safe_str(symbol).upper()
+    if not symbol_key:
+        return []
+
+    scan_time = _safe_str(scan_time_value)
+    normalized_grade = _safe_str(grade).upper()
+
+    with _GRADE_STATE_LOCK:
+        record = _GRADE_STATE.setdefault(symbol_key, {"trade_date": trade_date, "grades": [], "last_scan_time": ""})
+        if record.get("trade_date") != trade_date:
+            record["trade_date"] = trade_date
+            record["grades"] = []
+            record["last_scan_time"] = ""
+
+        history = list(record.get("grades") or [])
+        last_grade = history[-1] if history else ""
+        last_scan_time = _safe_str(record.get("last_scan_time"))
+
+        if scan_time and scan_time == last_scan_time and normalized_grade == _safe_str(last_grade).upper():
+            return history
+
+        record["last_scan_time"] = scan_time
+        history.append(normalized_grade)
+        history = history[-_GRADE_HISTORY_MAX:]
+        record["grades"] = history
+        return list(history)
+
+
+def _retest_ok(trade_side: str, price: float, vwap: float, or_high: float, or_low: float) -> bool:
+    if price <= 0:
+        return False
+    side = _safe_str(trade_side).upper()
+    if side == "LONG":
+        ref = max(_safe_float(or_high), _safe_float(vwap))
+        if ref <= 0:
+            return False
+        dist_pct = abs(price - ref) / ref * 100.0
+        return price >= ref and dist_pct <= 0.35
+    if side == "SHORT":
+        ref = min(_safe_float(or_low), _safe_float(vwap))
+        if ref <= 0:
+            return False
+        dist_pct = abs(price - ref) / ref * 100.0
+        return price <= ref and dist_pct <= 0.35
+    return False
+
+
+def _or_stretch_pct(trade_side: str, price: float, or_high: float, or_low: float) -> float:
+    side = _safe_str(trade_side).upper()
+    if price <= 0:
+        return 0.0
+    if side == "LONG" and or_high > 0:
+        return max(0.0, round(((price - or_high) / or_high) * 100.0, 2))
+    if side == "SHORT" and or_low > 0:
+        return max(0.0, round(((or_low - price) / or_low) * 100.0, 2))
+    return 0.0
+
+
+def _chase_risk(
+    trade_side: str,
+    grade: str,
+    vwap_distance_pct: float,
+    or_stretch_pct: float,
+    risks: Sequence[str],
+) -> str:
+    side = _safe_str(trade_side).upper()
+    normalized_grade = _safe_str(grade).upper()
+    if normalized_grade not in _ACTIONABLE_GRADES or side not in {"LONG", "SHORT"}:
+        return "NA"
+
+    abs_vwap = abs(_safe_float(vwap_distance_pct))
+    abs_or = max(0.0, _safe_float(or_stretch_pct))
+    risk_set = {str(r).strip().lower() for r in (risks or [])}
+
+    if "far_from_vwap" in risk_set or "extended" in risk_set or "one_bar_spike" in risk_set:
+        return "HIGH"
+    if abs_vwap >= 1.40 or abs_or >= 1.00:
+        return "HIGH"
+    if abs_vwap >= 0.95 or abs_or >= 0.65:
+        return "MEDIUM"
+    if abs_vwap <= 0.55 and abs_or <= 0.45:
+        return "LOW"
+    return "MEDIUM"
+
+
+def _entry_state(
+    trade_side: str,
+    grade: str,
+    chase_risk: str,
+    retest_ok: bool,
+    momentum_pulse_score: float,
+    pulse_trend_label: str,
+    direction_confidence: float,
+    volume_ratio: float,
+    range_ratio: float,
+    risks: Sequence[str],
+) -> str:
+    normalized_grade = _safe_str(grade).upper()
+    side = _safe_str(trade_side).upper()
+    if normalized_grade not in _ACTIONABLE_GRADES or side not in {"LONG", "SHORT"}:
+        return "CANCEL_SETUP"
+    if _safe_str(chase_risk).upper() == "HIGH":
+        return "AVOID_CHASE"
+    if retest_ok:
+        return "ENTER_ON_RETEST"
+
+    risk_set = {str(r).strip().lower() for r in (risks or [])}
+    trend_label = _safe_str(pulse_trend_label).lower()
+    healthy = (
+        _safe_float(momentum_pulse_score) >= 58.0
+        and _safe_float(direction_confidence) >= 14.0
+        and trend_label != "falling"
+        and _safe_float(volume_ratio) >= 1.0
+        and _safe_float(range_ratio) >= 1.0
+        and "momentum_decay" not in risk_set
+        and "fading_score" not in risk_set
+        and "low_consistency" not in risk_set
+    )
+    if _safe_str(chase_risk).upper() == "LOW" and healthy:
+        return "ENTER_NOW"
+    return "WAIT_CONFIRMATION"
+
+
+def _execution_rank(
+    trade_side: str,
+    grade: str,
+    momentum_pulse_score: float,
+    grade_stability_score: float,
+    direction_confidence: float,
+    volume_ratio: float,
+    range_ratio: float,
+    vwap_distance_pct: float,
+    chase_risk: str,
+    entry_state: str,
+    risks: Sequence[str],
+    retest_ok: bool,
+) -> float:
+    side = _safe_str(trade_side).upper()
+    normalized_grade = _safe_str(grade).upper()
+
+    grade_points = {"A_PLUS": 32.0, "A": 24.0, "FAILED_OR_CHOP": 8.0, "NO_TRADE": 0.0}.get(normalized_grade, 0.0)
+    momentum_component = max(0.0, min(100.0, _safe_float(momentum_pulse_score))) * 0.35
+    stability_component = max(0.0, min(100.0, _safe_float(grade_stability_score))) * 0.18
+    confidence_component = max(0.0, min(100.0, _safe_float(direction_confidence))) * 0.08
+
+    vol = max(0.0, min(3.0, _safe_float(volume_ratio)))
+    rng = max(0.0, min(3.0, _safe_float(range_ratio)))
+    volume_component = (vol / 3.0) * 10.0
+    range_component = (rng / 3.0) * 8.0
+
+    score = grade_points + momentum_component + stability_component + confidence_component + volume_component + range_component
+    if retest_ok:
+        score += 4.0
+
+    entry_bonus = {
+        "ENTER_NOW": 6.0,
+        "ENTER_ON_RETEST": 5.0,
+        "WAIT_CONFIRMATION": 2.0,
+        "AVOID_CHASE": -6.0,
+        "CANCEL_SETUP": -12.0,
+    }.get(_safe_str(entry_state).upper(), 0.0)
+    score += entry_bonus
+
+    abs_vwap = abs(_safe_float(vwap_distance_pct))
+    if abs_vwap > 0.60:
+        score -= min(24.0, (abs_vwap - 0.60) * 10.0)
+    if abs_vwap > 1.40:
+        score -= min(12.0, (abs_vwap - 1.40) * 8.0)
+
+    chase_penalty = {"HIGH": 14.0, "MEDIUM": 7.0, "LOW": 0.0, "NA": 10.0}.get(_safe_str(chase_risk).upper(), 6.0)
+    score -= chase_penalty
+
+    risk_weights = {
+        "far_from_vwap": 10.0,
+        "momentum_decay": 7.0,
+        "one_bar_spike": 8.0,
+        "low_consistency": 6.0,
+        "weak_relative_strength": 6.0,
+        "fading_score": 5.0,
+        "low_volume_confirmation": 4.0,
+        "extended": 8.0,
+        "long_failed_fast": 10.0,
+        "short_failed_fast": 10.0,
+    }
+    risk_set = {str(r).strip().lower() for r in (risks or [])}
+    for key, weight in risk_weights.items():
+        if key in risk_set:
+            score -= weight
+
+    if side not in {"LONG", "SHORT"}:
+        score -= 10.0
+
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    classified = classify_trade(row)
+    plan = build_entry_stop_exit(row, classified)
+
+    result = dict(row)
+    result.update(classified)
+    result.update(plan)
+
+    result["scan_time"] = _safe_str(row.get("scan_time"))
+    result["symbol"] = _safe_str(row.get("symbol"))
+    result["trade_date"] = _safe_str(row.get("trade_date"))
+    result["price_at_scan"] = _round_price(row.get("price_at_scan", row.get("ltp")))
+    result["prev_close"] = _round_price(row.get("prev_close"))
+    result["vwap"] = _round_price(row.get("vwap"))
+    result["or_high"] = _round_price(row.get("or_high", row.get("opening_range_high")))
+    result["or_low"] = _round_price(row.get("or_low", row.get("opening_range_low")))
+    result["vwap_distance_pct"] = round(_safe_float(row.get("vwap_distance_pct", row.get("distance_from_vwap_pct"))), 2)
+    result["volume_ratio"] = round(_safe_float(row.get("volume_ratio", row.get("volume_pace_ratio", row.get("volumepaceratio")))), 2)
+    result["range_ratio"] = round(_safe_float(row.get("range_ratio", row.get("range_expansion_ratio", row.get("rangeexpansionratio")))), 2)
+
+    result["direction"] = _safe_str(row.get("direction", result.get("trade_side"))).upper()
+    result["momentum_pulse_score"] = _safe_float(row.get("momentum_pulse_score"))
+    result["warning_flags"] = _extract_warning_flags(row)
+
+    trade_date = _safe_str(result.get("trade_date")) or datetime.now(IST).strftime("%Y-%m-%d")
+    symbol = _safe_str(result.get("symbol")).upper()
+    grade = _safe_str(result.get("grade")).upper()
+
+    grade_history = _update_grade_state(symbol, trade_date, grade, result.get("scan_time"))
+    stability_score = _grade_stability_score(grade_history)
+
+    trade_side = _safe_str(result.get("trade_side")).upper()
+    price = _safe_float(result.get("price_at_scan", result.get("ltp")))
+    vwap = _safe_float(result.get("vwap"))
+    or_high = _safe_float(result.get("or_high"))
+    or_low = _safe_float(result.get("or_low"))
+    vwap_dist = _safe_float(result.get("vwap_distance_pct"))
+    volume_ratio = _safe_float(result.get("volume_ratio"))
+    range_ratio = _safe_float(result.get("range_ratio"))
+    direction_confidence = _safe_float(row.get("direction_confidence"))
+    pulse_trend_label = _safe_str(row.get("pulse_trend_label"))
+    risks = _major_risk_flags(result)
+
+    retest_ok = _retest_ok(trade_side, price, vwap, or_high, or_low)
+    or_stretch = _or_stretch_pct(trade_side, price, or_high, or_low)
+    chase_risk = _chase_risk(trade_side, grade, vwap_dist, or_stretch, risks)
+    entry_state = _entry_state(
+        trade_side=trade_side,
+        grade=grade,
+        chase_risk=chase_risk,
+        retest_ok=retest_ok,
+        momentum_pulse_score=_safe_float(result.get("momentum_pulse_score")),
+        pulse_trend_label=pulse_trend_label,
+        direction_confidence=direction_confidence,
+        volume_ratio=volume_ratio,
+        range_ratio=range_ratio,
+        risks=risks,
+    )
+    execution_rank = _execution_rank(
+        trade_side=trade_side,
+        grade=grade,
+        momentum_pulse_score=_safe_float(result.get("momentum_pulse_score")),
+        grade_stability_score=stability_score,
+        direction_confidence=direction_confidence,
+        volume_ratio=volume_ratio,
+        range_ratio=range_ratio,
+        vwap_distance_pct=vwap_dist,
+        chase_risk=chase_risk,
+        entry_state=entry_state,
+        risks=risks,
+        retest_ok=retest_ok,
+    )
+
+    result["grade_history"] = grade_history
+    result["grade_stability_score"] = stability_score
+    result["retest_ok"] = bool(retest_ok)
+    result["chase_risk"] = chase_risk
+    result["entry_state"] = entry_state
+    result["execution_rank"] = execution_rank
+    result["or_stretch_pct"] = or_stretch
+    result["major_risks"] = list(risks)
+
+    return result
+
+
+def _sort_strategy_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    output = list(rows or [])
+    grade_priority = {
+        "A_PLUS": 4,
+        "A": 3,
+        "FAILED_OR_CHOP": 2,
+        "NO_TRADE": 1,
+    }
+    output.sort(
+        key=lambda x: (
+            _safe_float(x.get("execution_rank")),
+            grade_priority.get(_safe_str(x.get("grade")).upper(), 0),
+            _safe_float(x.get("score")),
+            _safe_float(x.get("volume_ratio")),
+            _safe_float(x.get("range_ratio")),
+        ),
+        reverse=True,
+    )
+    return output
+
+
+def build_strategy_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _sort_strategy_rows([build_strategy_row(row) for row in (rows or [])])
+
+
+def summarize_strategy(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = list(rows or [])
+    a_plus = [r for r in rows if _safe_str(r.get("grade")).upper() == "A_PLUS"]
+    a_only = [r for r in rows if _safe_str(r.get("grade")).upper() == "A"]
+    failed = [r for r in rows if _safe_str(r.get("grade")).upper() == "FAILED_OR_CHOP"]
+    no_trade = [r for r in rows if _safe_str(r.get("grade")).upper() == "NO_TRADE"]
+    longs = [r for r in rows if _safe_str(r.get("trade_side")).upper() == "LONG"]
+    shorts = [r for r in rows if _safe_str(r.get("trade_side")).upper() == "SHORT"]
+    enter_now = [r for r in rows if _safe_str(r.get("entry_state")).upper() == "ENTER_NOW"]
+    enter_retest = [r for r in rows if _safe_str(r.get("entry_state")).upper() == "ENTER_ON_RETEST"]
+    avoid = [r for r in rows if _safe_str(r.get("entry_state")).upper() in {"AVOID_CHASE", "CANCEL_SETUP"}]
+
+    def avg(items: Sequence[Dict[str, Any]], key: str) -> float:
+        vals = [_safe_float(i.get(key)) for i in items if i.get(key) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    return {
+        "total": len(rows),
+        "a_plus_count": len(a_plus),
+        "a_count": len(a_only),
+        "failed_or_chop_count": len(failed),
+        "no_trade_count": len(no_trade),
+        "long_count": len(longs),
+        "short_count": len(shorts),
+        "enter_now_count": len(enter_now),
+        "enter_on_retest_count": len(enter_retest),
+        "avoid_count": len(avoid),
+        "avg_volume_ratio": avg(rows, "volume_ratio"),
+        "avg_range_ratio": avg(rows, "range_ratio"),
+        "avg_execution_rank": avg(rows, "execution_rank"),
+        "avg_abs_change_pct": round(
+            sum(abs(_safe_float(r.get("change_pct_at_scan", r.get("changepct", r.get("change_pct"))))) for r in rows) / len(rows),
+            2
+        ) if rows else 0.0,
+        "a_plus_common": {
+            "avg_score": avg(a_plus, "score"),
+            "avg_vwap_dist": avg(a_plus, "vwap_distance_pct"),
+            "avg_volume_ratio": avg(a_plus, "volume_ratio"),
+            "avg_range_ratio": avg(a_plus, "range_ratio"),
+            "avg_execution_rank": avg(a_plus, "execution_rank"),
+        },
+        "a_common": {
+            "avg_score": avg(a_only, "score"),
+            "avg_vwap_dist": avg(a_only, "vwap_distance_pct"),
+            "avg_volume_ratio": avg(a_only, "volume_ratio"),
+            "avg_range_ratio": avg(a_only, "range_ratio"),
+            "avg_execution_rank": avg(a_only, "execution_rank"),
+        },
+    }
 
 
 def _filter_strategy_rows(
@@ -601,405 +894,56 @@ def _filter_strategy_rows(
     return filtered_rows, normalized_direction, normalized_grade
 
 
-def _build_strategy_response(
-    strategy_rows: Sequence[Dict[str, Any]],
-    *,
-    status: str,
-    message: str,
-    last_updated: str,
-    market_data_last_updated: str,
-    benchmark_change_pct: float,
-    direction: str,
-    grade: str,
-    limit: int,
-    extra_fields: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    ordered_rows = _sort_strategy_rows(strategy_rows)
-    filtered_rows, normalized_direction, normalized_grade = _filter_strategy_rows(
-        ordered_rows,
-        direction=direction,
-        grade=grade,
-        limit=limit,
-    )
-
-    response = {
-        "feature": "Momentum Pulse Strategy",
-        "feature_key": "momentum_pulse_strategy",
-        "status": _safe_str(status, "ready"),
-        "message": _safe_str(message),
-        "last_updated": _safe_str(last_updated),
-        "market_data_last_updated": _safe_str(market_data_last_updated, last_updated),
-        "benchmark_change_pct": round(_safe_float(benchmark_change_pct), 2),
-        "direction": normalized_direction,
-        "grade": normalized_grade,
-        "rows": filtered_rows,
-        "total": len(filtered_rows),
-        "total_candidates": len(ordered_rows),
-        "summary": summarize_strategy(filtered_rows),
-        "overall_summary": summarize_strategy(ordered_rows),
-        "available_directions": ["ALL", "LONG", "SHORT"],
-        "available_grades": ["ALL", "A_PLUS", "A", "FAILED_OR_CHOP", "NO_TRADE"],
-    }
-    if extra_fields:
-        response.update(extra_fields)
-    return response
-
-
-def _chunked(items: Sequence[Any], size: int) -> List[List[Any]]:
-    step = max(1, int(size or 1))
-    return [list(items[index:index + step]) for index in range(0, len(items), step)]
-
-
-def _normalize_scanner_symbols(items: Optional[Sequence[Any]]) -> List[str]:
-    normalized: List[str] = []
-    seen = set()
-    for item in items or []:
-        raw = item.get("symbol") if isinstance(item, dict) else item
-        symbol = _safe_str(raw).upper().replace(".NS", "")
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        normalized.append(symbol)
-    return normalized
-
-
-def _iter_entry_window_scan_times() -> List[time]:
-    anchor = datetime.now(IST).date()
-    current = datetime.combine(anchor, ENTRY_WINDOW_START)
-    end = datetime.combine(anchor, ENTRY_WINDOW_END_EXCLUSIVE)
-    slots: List[time] = []
-    while current < end:
-        slots.append(current.time())
-        current += timedelta(minutes=5)
-    return slots
-
-
-def _slice_vwap(session_slice: pd.DataFrame) -> float:
-    if session_slice is None or session_slice.empty:
-        return 0.0
-    volume = pd.Series(session_slice["Volume"], dtype="float64").fillna(0.0)
-    total_volume = float(volume.sum())
-    if total_volume <= 0:
-        return 0.0
-    typical_price = (
-        pd.Series(session_slice["High"], dtype="float64")
-        + pd.Series(session_slice["Low"], dtype="float64")
-        + pd.Series(session_slice["Close"], dtype="float64")
-    ) / 3.0
-    return round(float((typical_price * volume).sum() / total_volume), 2)
-
-
-def _build_historical_stock_snapshot(symbol: str, session_slice: pd.DataFrame, prev_close: float) -> Optional[Dict[str, Any]]:
-    if session_slice is None or session_slice.empty:
-        return None
-    live_price = _safe_float(session_slice["Close"].iloc[-1])
-    if live_price <= 0 or prev_close <= 0:
-        return None
-    change_pct = round(((live_price - prev_close) / prev_close) * 100.0, 2)
+def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "symbol": symbol,
-        "ltp": round(live_price, 2),
-        "change_pct": change_pct,
-        "vwap": _slice_vwap(session_slice),
+        "symbol": _safe_str(row.get("symbol")),
+        "scan_time": _safe_str(row.get("scan_time")),
+        "trade_side": _safe_str(row.get("trade_side")),
+        "grade": _safe_str(row.get("grade")),
+        "entry_state": _safe_str(row.get("entry_state")),
+        "execution_rank": _safe_float(row.get("execution_rank")),
+        "price_at_scan": row.get("price_at_scan"),
+        "vwap_distance_pct": _safe_float(row.get("vwap_distance_pct")),
+        "volume_ratio": _safe_float(row.get("volume_ratio")),
+        "range_ratio": _safe_float(row.get("range_ratio")),
+        "entry_price": row.get("entry_price"),
+        "stop_loss": row.get("stop_loss"),
+        "target_1": row.get("target_1"),
+        "target_2": row.get("target_2"),
+        "reasons": list(row.get("reasons") or [])[:6],
+        "major_risks": list(row.get("major_risks") or [])[:6],
     }
 
 
-def _build_sector_data_from_snapshots(stock_snapshots: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    sector_values: Dict[str, List[float]] = {}
-    for snapshot in stock_snapshots:
-        symbol = _safe_str(snapshot.get("symbol")).upper()
-        sector = _SYMBOL_TO_SECTOR.get(symbol)
-        if not sector:
-            continue
-        sector_values.setdefault(sector, []).append(_safe_float(snapshot.get("change_pct")))
+def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    ordered = _sort_strategy_rows(rows)
+
+    def actionable(row: Dict[str, Any]) -> bool:
+        return (
+            _safe_str(row.get("grade")).upper() in _ACTIONABLE_GRADES
+            and _safe_str(row.get("trade_side")).upper() in {"LONG", "SHORT"}
+            and _safe_str(row.get("entry_state")).upper() not in {"AVOID_CHASE", "CANCEL_SETUP"}
+        )
+
+    overall_best = [_thin_row_for_bucket(r) for r in ordered[:8]]
+    best_longs = [_thin_row_for_bucket(r) for r in ordered if actionable(r) and _safe_str(r.get("trade_side")).upper() == "LONG"][:6]
+    best_shorts = [_thin_row_for_bucket(r) for r in ordered if actionable(r) and _safe_str(r.get("trade_side")).upper() == "SHORT"][:6]
+    avoid_list = [
+        _thin_row_for_bucket(r)
+        for r in ordered
+        if _safe_str(r.get("entry_state")).upper() in {"AVOID_CHASE", "CANCEL_SETUP"}
+        or _safe_str(r.get("grade")).upper() in {"FAILED_OR_CHOP", "NO_TRADE"}
+    ][:12]
 
     return {
-        sector_name: {"result": {"current": round(sum(changes) / len(changes), 2)}}
-        for sector_name, changes in sector_values.items()
-        if changes
+        "overall_best": overall_best,
+        "best_longs": best_longs,
+        "best_shorts": best_shorts,
+        "avoid_list": avoid_list,
     }
 
 
-def _historical_session_view(
-    sessions: Sequence[Tuple[calendar_date, pd.DataFrame]],
-    trade_date: calendar_date,
-    scan_time: time,
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], float]:
-    historical_frames: List[pd.DataFrame] = []
-    current_slice: Optional[pd.DataFrame] = None
-
-    for session_date, session_df in sessions:
-        if session_date < trade_date:
-            historical_frames.append(session_df)
-            continue
-        if session_date == trade_date:
-            current_slice = session_df[session_df.index.time <= scan_time].copy()
-            break
-        break
-
-    if current_slice is None or current_slice.empty or not historical_frames:
-        return None, None, 0.0
-
-    prev_close = _safe_float(historical_frames[-1]["Close"].dropna().iloc[-1])
-    combined = pd.concat(list(historical_frames[-LOOKBACK_SESSIONS:]) + [current_slice], axis=0)
-    return combined, current_slice, prev_close
-
-
-def _build_historical_nifty_change_map(trade_date: calendar_date) -> Dict[str, float]:
-    from_date = (trade_date - timedelta(days=_HISTORICAL_LOOKBACK_CALENDAR_DAYS)).isoformat()
-    to_date = trade_date.isoformat()
-    nifty_df = None
-
-    try:
-        raw = _download_intraday_batch_for_range(["NIFTY"], from_date=from_date, to_date=to_date)
-        nifty_df = _get_sym_df(raw, "NIFTY")
-    except Exception:
-        nifty_df = None
-
-    if nifty_df is None or nifty_df.empty:
-        try:
-            import os
-            os.environ["YFINANCE_CACHE"] = "/tmp/yfinance_cache"
-            import yfinance as yf
-
-            end_exclusive = (trade_date + timedelta(days=1)).isoformat()
-            raw = yf.download(
-                tickers="^NSEI",
-                start=from_date,
-                end=end_exclusive,
-                interval="5m",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                timeout=20,
-            )
-            nifty_df = _get_sym_df(raw, "^NSEI")
-        except Exception:
-            nifty_df = None
-
-    sessions = _split_sessions(nifty_df)
-    if len(sessions) < 2:
-        return {}
-
-    target_session = next((session_df for session_date, session_df in sessions if session_date == trade_date), None)
-    previous_sessions = [session_df for session_date, session_df in sessions if session_date < trade_date]
-    if target_session is None or not previous_sessions:
-        return {}
-
-    prev_close = _safe_float(previous_sessions[-1]["Close"].dropna().iloc[-1])
-    if prev_close <= 0:
-        return {}
-
-    change_map: Dict[str, float] = {}
-    for timestamp, bar in target_session.iterrows():
-        close = _safe_float(bar.get("Close"))
-        if close > 0:
-            change_map[timestamp.strftime("%H:%M")] = round(((close - prev_close) / prev_close) * 100.0, 2)
-    return change_map
-
-
-def _choose_representative_daily_row(
-    existing: Optional[Dict[str, Any]],
-    candidate: Dict[str, Any],
-) -> Dict[str, Any]:
-    if existing is None:
-        return candidate
-
-    existing_grade = _safe_str(existing.get("grade")).upper()
-    candidate_grade = _safe_str(candidate.get("grade")).upper()
-    existing_actionable = existing_grade in _ACTIONABLE_GRADES
-    candidate_actionable = candidate_grade in _ACTIONABLE_GRADES
-
-    if existing_actionable:
-        return existing
-    if candidate_actionable:
-        return candidate
-
-    grade_priority = {"FAILED_OR_CHOP": 2, "NO_TRADE": 1}
-    existing_priority = grade_priority.get(existing_grade, 0)
-    candidate_priority = grade_priority.get(candidate_grade, 0)
-    if candidate_priority != existing_priority:
-        return candidate if candidate_priority > existing_priority else existing
-
-    existing_time = _parse_scan_time(existing.get("scan_time")) or time(23, 59)
-    candidate_time = _parse_scan_time(candidate.get("scan_time")) or time(23, 59)
-    if candidate_time != existing_time:
-        return candidate if candidate_time < existing_time else existing
-
-    if _safe_float(candidate.get("score")) != _safe_float(existing.get("score")):
-        return candidate if _safe_float(candidate.get("score")) > _safe_float(existing.get("score")) else existing
-
-    return candidate if _safe_float(candidate.get("range_ratio")) > _safe_float(existing.get("range_ratio")) else existing
-
-
-def _simulate_trade_outcome(
-    row: Dict[str, Any],
-    sessions: Sequence[Tuple[calendar_date, pd.DataFrame]],
-) -> Dict[str, Any]:
-    grade = _safe_str(row.get("grade")).upper()
-    direction = _safe_str(row.get("trade_side")).upper()
-    entry_price = _safe_float(row.get("entry_price"))
-    stop_loss = _safe_float(row.get("stop_loss"))
-    target_1 = _safe_float(row.get("target_1"))
-    target_2 = _safe_float(row.get("target_2"))
-    scan_time = _parse_scan_time(row.get("scan_time"))
-    trade_date_text = _safe_str(row.get("trade_date"))
-
-    if grade not in _ACTIONABLE_GRADES or direction not in {"LONG", "SHORT"}:
-        return {
-            "historical_outcome": "NO_ENTRY",
-            "historical_exit_time": "",
-            "historical_exit_price": None,
-            "historical_pnl_pct": 0.0,
-            "historical_rr_realized": 0.0,
-            "historical_outcome_reason": "",
-            "loss_reason": _safe_str(row.get("loss_reason")),
-        }
-
-    target_session = next(
-        (session_df for session_date, session_df in sessions if session_date.isoformat() == trade_date_text),
-        None,
-    )
-    if target_session is None or scan_time is None or entry_price <= 0 or stop_loss <= 0:
-        return {
-            "historical_outcome": "NO_DATA",
-            "historical_exit_time": "",
-            "historical_exit_price": None,
-            "historical_pnl_pct": 0.0,
-            "historical_rr_realized": 0.0,
-            "historical_outcome_reason": "Historical session data unavailable",
-            "loss_reason": "Historical session data unavailable",
-        }
-
-    future_session = target_session[target_session.index.time > scan_time].copy()
-    risk = abs(entry_price - stop_loss)
-    if risk <= 0:
-        return {
-            "historical_outcome": "NO_DATA",
-            "historical_exit_time": "",
-            "historical_exit_price": None,
-            "historical_pnl_pct": 0.0,
-            "historical_rr_realized": 0.0,
-            "historical_outcome_reason": "Invalid risk definition",
-            "loss_reason": "Invalid risk definition",
-        }
-
-    def _finalize(outcome: str, exit_price: float, exit_time: str, reason: str) -> Dict[str, Any]:
-        points = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
-        pnl_pct = round((points / max(entry_price, 1e-6)) * 100.0, 2)
-        rr_realized = round(points / risk, 2)
-        loss_reason = reason if points < 0 else _safe_str(row.get("loss_reason"))
-        return {
-            "historical_outcome": outcome,
-            "historical_exit_time": exit_time,
-            "historical_exit_price": _round_price(exit_price),
-            "historical_pnl_pct": pnl_pct,
-            "historical_rr_realized": rr_realized,
-            "historical_outcome_reason": reason,
-            "loss_reason": loss_reason,
-        }
-
-    for timestamp, bar in future_session.iterrows():
-        high = _safe_float(bar.get("High"))
-        low = _safe_float(bar.get("Low"))
-
-        if direction == "LONG":
-            stop_hit = low <= stop_loss
-            target_2_hit = target_2 > 0 and high >= target_2
-            target_1_hit = target_1 > 0 and high >= target_1
-            if stop_hit and (target_1_hit or target_2_hit):
-                return _finalize(
-                    "STOP_LOSS",
-                    stop_loss,
-                    timestamp.strftime("%H:%M"),
-                    "Stop and target both touched in same candle; conservative stop-first assumption",
-                )
-            if stop_hit:
-                return _finalize("STOP_LOSS", stop_loss, timestamp.strftime("%H:%M"), "Stop loss hit before target")
-            if target_2_hit:
-                return _finalize("TARGET_2", target_2, timestamp.strftime("%H:%M"), "Target 2 hit")
-            if target_1_hit:
-                return _finalize("TARGET_1", target_1, timestamp.strftime("%H:%M"), "Target 1 hit")
-        else:
-            stop_hit = high >= stop_loss
-            target_2_hit = target_2 > 0 and low <= target_2
-            target_1_hit = target_1 > 0 and low <= target_1
-            if stop_hit and (target_1_hit or target_2_hit):
-                return _finalize(
-                    "STOP_LOSS",
-                    stop_loss,
-                    timestamp.strftime("%H:%M"),
-                    "Stop and target both touched in same candle; conservative stop-first assumption",
-                )
-            if stop_hit:
-                return _finalize("STOP_LOSS", stop_loss, timestamp.strftime("%H:%M"), "Stop loss hit before target")
-            if target_2_hit:
-                return _finalize("TARGET_2", target_2, timestamp.strftime("%H:%M"), "Target 2 hit")
-            if target_1_hit:
-                return _finalize("TARGET_1", target_1, timestamp.strftime("%H:%M"), "Target 1 hit")
-
-    if future_session.empty:
-        eod_price = _safe_float(row.get("price_at_scan", row.get("entry_price")))
-        eod_time = _safe_str(row.get("scan_time"))
-    else:
-        eod_price = _safe_float(future_session["Close"].iloc[-1], _safe_float(row.get("price_at_scan", row.get("entry_price"))))
-        eod_time = future_session.index[-1].strftime("%H:%M")
-    eod_points = (eod_price - entry_price) if direction == "LONG" else (entry_price - eod_price)
-    if abs(eod_points) <= max(entry_price * 0.0005, 0.01):
-        return _finalize("EOD_FLAT", eod_price, eod_time, "No stop/target hit; exited near flat at session close")
-    if eod_points > 0:
-        return _finalize("EOD_PROFIT", eod_price, eod_time, "No stop/target hit; exited in profit at session close")
-    return _finalize("EOD_LOSS", eod_price, eod_time, "No stop/target hit; exited in loss at session close")
-
-
-def _summarize_performance(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    actionable_rows = [
-        row for row in (rows or [])
-        if _safe_str(row.get("grade")).upper() in _ACTIONABLE_GRADES
-        and _safe_str(row.get("historical_outcome")).upper() not in {"", "NO_ENTRY", "NO_DATA"}
-    ]
-    if not actionable_rows:
-        return {
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate": 0.0,
-            "target_1_hits": 0,
-            "target_2_hits": 0,
-            "stop_loss_hits": 0,
-            "eod_profit_count": 0,
-            "eod_loss_count": 0,
-            "eod_flat_count": 0,
-            "avg_pnl_pct": 0.0,
-            "avg_rr_realized": 0.0,
-        }
-
-    wins = [
-        row for row in actionable_rows
-        if _safe_str(row.get("historical_outcome")).upper() in {"TARGET_1", "TARGET_2", "EOD_PROFIT"}
-    ]
-    losses = [
-        row for row in actionable_rows
-        if _safe_str(row.get("historical_outcome")).upper() in {"STOP_LOSS", "EOD_LOSS"}
-    ]
-
-    return {
-        "trades": len(actionable_rows),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": round((len(wins) / len(actionable_rows)) * 100.0, 2) if actionable_rows else 0.0,
-        "target_1_hits": sum(1 for row in actionable_rows if _safe_str(row.get("historical_outcome")).upper() == "TARGET_1"),
-        "target_2_hits": sum(1 for row in actionable_rows if _safe_str(row.get("historical_outcome")).upper() == "TARGET_2"),
-        "stop_loss_hits": sum(1 for row in actionable_rows if _safe_str(row.get("historical_outcome")).upper() == "STOP_LOSS"),
-        "eod_profit_count": sum(1 for row in actionable_rows if _safe_str(row.get("historical_outcome")).upper() == "EOD_PROFIT"),
-        "eod_loss_count": sum(1 for row in actionable_rows if _safe_str(row.get("historical_outcome")).upper() == "EOD_LOSS"),
-        "eod_flat_count": sum(1 for row in actionable_rows if _safe_str(row.get("historical_outcome")).upper() == "EOD_FLAT"),
-        "avg_pnl_pct": round(sum(_safe_float(row.get("historical_pnl_pct")) for row in actionable_rows) / len(actionable_rows), 2),
-        "avg_rr_realized": round(sum(_safe_float(row.get("historical_rr_realized")) for row in actionable_rows) / len(actionable_rows), 2),
-    }
-
-
-def build_strategy_payload(
+def build_live_strategy_payload(
     pulse_result: Dict[str, Any],
     direction: str = "ALL",
     grade: str = "ALL",
@@ -1012,17 +956,47 @@ def build_strategy_payload(
 
     prepared_rows = [_prepare_strategy_input_row(row, trade_date) for row in pulse_stocks]
     strategy_rows = build_strategy_rows(prepared_rows)
-    return _build_strategy_response(
+    filtered_rows, normalized_direction, normalized_grade = _filter_strategy_rows(
         strategy_rows,
-        status=_safe_str(pulse_result.get("status", "ready")),
-        message=_safe_str(pulse_result.get("message")),
-        last_updated=last_updated,
-        market_data_last_updated=market_data_last_updated,
-        benchmark_change_pct=_safe_float(pulse_result.get("benchmark_change_pct")),
         direction=direction,
         grade=grade,
         limit=limit,
     )
+
+    status = _safe_str(pulse_result.get("status", "ready"))
+    message = _safe_str(pulse_result.get("message"))
+    benchmark_change_pct = round(_safe_float(pulse_result.get("benchmark_change_pct")), 2)
+
+    return {
+        "feature": "Momentum Pulse Strategy",
+        "feature_key": "momentum_pulse_strategy",
+        "mode": "live",
+        "status": status,
+        "message": message,
+        "last_updated": last_updated,
+        "market_data_last_updated": market_data_last_updated,
+        "benchmark_change_pct": benchmark_change_pct,
+        "direction": normalized_direction,
+        "grade": normalized_grade,
+        "rows": filtered_rows,
+        "total": len(filtered_rows),
+        "total_candidates": len(strategy_rows),
+        "summary": summarize_strategy(filtered_rows),
+        "overall_summary": summarize_strategy(strategy_rows),
+        "best_stocks": build_best_stock_buckets(strategy_rows),
+        "available_directions": ["ALL", "LONG", "SHORT"],
+        "available_grades": ["ALL", "A_PLUS", "A", "FAILED_OR_CHOP", "NO_TRADE"],
+    }
+
+
+def build_strategy_payload(
+    pulse_result: Dict[str, Any],
+    direction: str = "ALL",
+    grade: str = "ALL",
+    limit: int = 40,
+) -> Dict[str, Any]:
+    # Backward-compatible wrapper used by existing route integrations.
+    return build_live_strategy_payload(pulse_result=pulse_result, direction=direction, grade=grade, limit=limit)
 
 
 def build_historical_strategy_payload(
@@ -1033,145 +1007,33 @@ def build_historical_strategy_payload(
     include_veryweak: bool = True,
     scanner_symbols: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Any]:
-    try:
-        trade_date = datetime.strptime(_safe_str(target_date), "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise ValueError(f"Invalid date format '{target_date}': use YYYY-MM-DD") from exc
+    # Historical replay is intentionally disabled in this module to keep 512MB deployments safe.
+    # This function remains for route compatibility only.
+    _ = include_veryweak
+    _ = scanner_symbols
 
-    if trade_date > datetime.now(IST).date():
-        raise ValueError(f"Historical strategy date '{target_date}' cannot be in the future")
+    filtered_rows: List[Dict[str, Any]] = []
+    normalized_direction = _normalize_direction_filter(direction)
+    normalized_grade = _normalize_grade_filter(grade)
 
-    normalized_symbols = _normalize_scanner_symbols(scanner_symbols) or _normalize_scanner_symbols(SCANNER_STOCKS)
-    symbols_ns = [f"{symbol}.NS" for symbol in normalized_symbols]
-    if not symbols_ns:
-        return _build_strategy_response(
-            [],
-            status="ready",
-            message=f"No scanner symbols configured for historical replay on {trade_date.isoformat()}",
-            last_updated=trade_date.isoformat(),
-            market_data_last_updated=trade_date.isoformat(),
-            benchmark_change_pct=0.0,
-            direction=direction,
-            grade=grade,
-            limit=limit,
-            extra_fields={
-                "mode": "historical",
-                "requested_date": trade_date.isoformat(),
-                "performance_summary": _summarize_performance([]),
-                "overall_performance_summary": _summarize_performance([]),
-            },
-        )
+    return {
+        "feature": "Momentum Pulse Strategy",
+        "feature_key": "momentum_pulse_strategy",
+        "mode": "historical",
+        "status": "disabled",
+        "message": f"Historical replay is disabled on this deployment (requested_date={_safe_str(target_date)})",
+        "last_updated": "",
+        "market_data_last_updated": "",
+        "benchmark_change_pct": 0.0,
+        "direction": normalized_direction,
+        "grade": normalized_grade,
+        "rows": filtered_rows,
+        "total": 0,
+        "total_candidates": 0,
+        "summary": summarize_strategy(filtered_rows),
+        "overall_summary": summarize_strategy([]),
+        "best_stocks": build_best_stock_buckets([]),
+        "available_directions": ["ALL", "LONG", "SHORT"],
+        "available_grades": ["ALL", "A_PLUS", "A", "FAILED_OR_CHOP", "NO_TRADE"],
+    }
 
-    from_date = (trade_date - timedelta(days=_HISTORICAL_LOOKBACK_CALENDAR_DAYS)).isoformat()
-    sessions_by_symbol: Dict[str, List[Tuple[calendar_date, pd.DataFrame]]] = {}
-
-    for batch in _chunked(symbols_ns, MOMENTUM_PULSE_BATCH_SIZE):
-        raw = _download_intraday_batch_for_range(batch, from_date=from_date, to_date=trade_date.isoformat())
-        if raw is None or raw.empty:
-            continue
-        for symbol_ns in batch:
-            frame = _get_sym_df(raw, symbol_ns)
-            if frame is None or frame.empty:
-                continue
-            clean_symbol = symbol_ns.replace(".NS", "")
-            sessions = _split_sessions(frame)
-            if any(session_date == trade_date for session_date, _ in sessions):
-                sessions_by_symbol[clean_symbol] = sessions
-
-    if not sessions_by_symbol:
-        return _build_strategy_response(
-            [],
-            status="ready",
-            message=f"No 5-minute history found for {trade_date.isoformat()}",
-            last_updated=trade_date.isoformat(),
-            market_data_last_updated=trade_date.isoformat(),
-            benchmark_change_pct=0.0,
-            direction=direction,
-            grade=grade,
-            limit=limit,
-            extra_fields={
-                "mode": "historical",
-                "requested_date": trade_date.isoformat(),
-                "performance_summary": _summarize_performance([]),
-                "overall_performance_summary": _summarize_performance([]),
-            },
-        )
-
-    nifty_change_map = _build_historical_nifty_change_map(trade_date)
-    scan_times = _iter_entry_window_scan_times()
-    trend_state: Dict[str, Dict[str, Any]] = {}
-    representative_by_symbol: Dict[str, Dict[str, Any]] = {}
-
-    for scan_time in scan_times:
-        snapshot_inputs: List[Tuple[str, pd.DataFrame, Dict[str, Any]]] = []
-        for symbol, sessions in sessions_by_symbol.items():
-            combined_df, session_slice, prev_close = _historical_session_view(sessions, trade_date, scan_time)
-            if combined_df is None or session_slice is None or prev_close <= 0:
-                continue
-            snapshot = _build_historical_stock_snapshot(symbol, session_slice, prev_close)
-            if snapshot:
-                snapshot_inputs.append((symbol, combined_df, snapshot))
-
-        if not snapshot_inputs:
-            continue
-
-        sector_data = _build_sector_data_from_snapshots([snapshot for _, _, snapshot in snapshot_inputs])
-        scan_key = scan_time.strftime("%H:%M")
-        nifty_change_pct = _safe_float(nifty_change_map.get(scan_key))
-
-        pulse_rows: List[Dict[str, Any]] = []
-        for _symbol, combined_df, snapshot in snapshot_inputs:
-            pulse_row = _evaluate_symbol(
-                snapshot,
-                combined_df,
-                nifty_change_pct,
-                sector_data=sector_data,
-                oi_cache={},
-                trend_state=trend_state,
-            )
-            if pulse_row is None:
-                continue
-            if not include_veryweak and _safe_str(pulse_row.get("tier")).lower() == "veryweak":
-                continue
-            pulse_rows.append(pulse_row)
-
-        pulse_rows.sort(
-            key=lambda item: (
-                _safe_float(item.get("momentum_pulse_score")),
-                _safe_float(item.get("pulse_trend_strength")),
-                _safe_float(item.get("direction_confidence")),
-                abs(_safe_float(item.get("relative_strength"))),
-            ),
-            reverse=True,
-        )
-        for index, pulse_row in enumerate(pulse_rows, start=1):
-            pulse_row["rank"] = index
-            prepared = _prepare_strategy_input_row(pulse_row, trade_date.isoformat())
-            strategy_row = build_strategy_row(prepared)
-            strategy_row.update(_simulate_trade_outcome(strategy_row, sessions_by_symbol.get(_safe_str(strategy_row.get("symbol")).upper(), [])))
-            symbol_key = _safe_str(strategy_row.get("symbol")).upper()
-            representative_by_symbol[symbol_key] = _choose_representative_daily_row(
-                representative_by_symbol.get(symbol_key),
-                strategy_row,
-            )
-
-    strategy_rows = _sort_strategy_rows(representative_by_symbol.values())
-    filtered_rows, _, _ = _filter_strategy_rows(strategy_rows, direction=direction, grade=grade, limit=limit)
-
-    return _build_strategy_response(
-        strategy_rows,
-        status="ready",
-        message=f"Historical strategy replay for {trade_date.isoformat()} built from 5-minute data",
-        last_updated=trade_date.isoformat(),
-        market_data_last_updated=trade_date.isoformat(),
-        benchmark_change_pct=_safe_float(nifty_change_map.get("10:55", 0.0)),
-        direction=direction,
-        grade=grade,
-        limit=limit,
-        extra_fields={
-            "mode": "historical",
-            "requested_date": trade_date.isoformat(),
-            "performance_summary": _summarize_performance(filtered_rows),
-            "overall_performance_summary": _summarize_performance(strategy_rows),
-        },
-    )
