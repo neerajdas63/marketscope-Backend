@@ -910,6 +910,13 @@ def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
         "stop_loss": row.get("stop_loss"),
         "target_1": row.get("target_1"),
         "target_2": row.get("target_2"),
+        "rr_t1": row.get("rr_t1"),
+        "rr_t2": row.get("rr_t2"),
+        "or_high": row.get("or_high"),
+        "or_low": row.get("or_low"),
+        "retest_ok": row.get("retest_ok"),
+        "chase_risk": _safe_str(row.get("chase_risk")),
+        "grade_stability_score": _safe_float(row.get("grade_stability_score")),
         "reasons": list(row.get("reasons") or [])[:6],
         "major_risks": list(row.get("major_risks") or [])[:6],
     }
@@ -925,9 +932,20 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             and _safe_str(row.get("entry_state")).upper() not in {"AVOID_CHASE", "CANCEL_SETUP"}
         )
 
-    overall_best = [_thin_row_for_bucket(r) for r in ordered[:8]]
-    best_longs = [_thin_row_for_bucket(r) for r in ordered if actionable(r) and _safe_str(r.get("trade_side")).upper() == "LONG"][:6]
-    best_shorts = [_thin_row_for_bucket(r) for r in ordered if actionable(r) and _safe_str(r.get("trade_side")).upper() == "SHORT"][:6]
+    actionable_rows = [r for r in ordered if actionable(r)]
+
+    overall_best = [_thin_row_for_bucket(r) for r in actionable_rows[:8]]
+    best_longs = [
+        _thin_row_for_bucket(r)
+        for r in actionable_rows
+        if _safe_str(r.get("trade_side")).upper() == "LONG"
+    ][:6]
+    best_shorts = [
+        _thin_row_for_bucket(r)
+        for r in actionable_rows
+        if _safe_str(r.get("trade_side")).upper() == "SHORT"
+    ][:6]
+
     avoid_list = [
         _thin_row_for_bucket(r)
         for r in ordered
