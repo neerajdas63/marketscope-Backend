@@ -23,6 +23,10 @@ from backend.momentum_pulse_strategy import (
     build_historical_strategy_payload as build_historical_momentum_pulse_strategy_payload,
     build_strategy_payload as build_momentum_pulse_strategy_payload,
 )
+from backend.momentum_pulse_strategy_review import (
+    build_strategy_review_payload as build_momentum_pulse_strategy_review_payload,
+    record_strategy_signals,
+)
 from backend.pulse_navigator import get_pulse_navigator, get_pulse_navigator_tab
 from backend.trade_guardian import (
     acknowledge_alert,
@@ -460,15 +464,45 @@ async def momentum_pulse_strategy_endpoint(
             include_veryweak=include_veryweak,
             limit=max(120, limit * 4),
         )
-        return build_momentum_pulse_strategy_payload(
+        strategy_payload = build_momentum_pulse_strategy_payload(
             pulse_result=pulse_result,
             direction=direction,
             grade=grade,
             limit=limit,
         )
+        try:
+            record_payload = strategy_payload
+            if str(direction or "ALL").upper() != "ALL" or str(grade or "ALL").upper() != "ALL" or limit < 120:
+                record_payload = build_momentum_pulse_strategy_payload(
+                    pulse_result=pulse_result,
+                    direction="ALL",
+                    grade="ALL",
+                    limit=max(120, limit * 4),
+                )
+            record_strategy_signals(record_payload)
+        except Exception as record_exc:
+            logger.warning("Momentum Pulse Strategy signal recording failed: %s", record_exc)
+        return strategy_payload
     except Exception as exc:
         logger.error("Momentum Pulse Strategy endpoint error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Momentum Pulse Strategy computation failed") from exc
+
+
+@app.get("/momentum-pulse/strategy-review", summary="Post-market win/loss review for recorded Momentum Pulse Strategy signals", tags=["Market Data"])
+async def momentum_pulse_strategy_review_endpoint(
+    date: str = "",
+    days: int = 1,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    try:
+        return build_momentum_pulse_strategy_review_payload(
+            target_date=date,
+            days=days,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error("Momentum Pulse Strategy review endpoint error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Momentum Pulse Strategy review failed") from exc
 
 
 @app.get("/pulse-navigator", summary="Curated discovery upgrade built on Momentum Pulse", tags=["Market Data"])
