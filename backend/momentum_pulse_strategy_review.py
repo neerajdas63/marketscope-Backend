@@ -408,7 +408,7 @@ def build_strategy_review_payload(target_date: str = "", days: int = 1, limit: i
             "feature_key": "momentum_pulse_strategy_review",
             "mode": "review",
             "status": "empty",
-            "message": "No recorded Momentum Pulse Strategy signals found for the selected date range",
+            "message": "No recorded signals found. Review needs signals captured during the live 09:35-12:00 window; future signals are now auto-recorded from Momentum Pulse refresh.",
             "dates": selected,
             "rows": [],
             "total": 0,

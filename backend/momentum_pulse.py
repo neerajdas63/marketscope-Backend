@@ -1291,14 +1291,36 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
 def _refresh_momentum_pulse_cache(source_key: str, scanner_stocks: List[Dict[str, Any]]) -> None:
     try:
         results, benchmark_change_pct = _compute_momentum_pulse(scanner_stocks)
+        pulse_last_updated = _now_ist_str()
         with _lock:
             _pulse_cache["source_key"] = source_key
             _pulse_cache["computed_at"] = time.time()
-            _pulse_cache["last_updated"] = _now_ist_str()
+            _pulse_cache["last_updated"] = pulse_last_updated
             _pulse_cache["benchmark_change_pct"] = benchmark_change_pct
             _pulse_cache["results"] = results
             _pulse_cache["has_completed"] = True
             _pulse_cache["error"] = ""
+        try:
+            market_data_last_updated = str(source_key.split("|")[1] if "|" in source_key else pulse_last_updated)
+            pulse_result = {
+                "stocks": results,
+                "last_updated": pulse_last_updated,
+                "market_data_last_updated": market_data_last_updated,
+                "benchmark_change_pct": benchmark_change_pct,
+                "status": "ready",
+            }
+            from backend.momentum_pulse_strategy import build_live_strategy_payload
+            from backend.momentum_pulse_strategy_review import record_strategy_signals
+
+            strategy_payload = build_live_strategy_payload(
+                pulse_result=pulse_result,
+                direction="ALL",
+                grade="ALL",
+                limit=max(120, len(results)),
+            )
+            record_strategy_signals(strategy_payload)
+        except Exception as record_exc:
+            logger.warning("Momentum Pulse Strategy auto-record failed: %s", record_exc)
     except Exception as exc:
         logger.error("Momentum Pulse refresh failed: %s", exc, exc_info=True)
         with _lock:
