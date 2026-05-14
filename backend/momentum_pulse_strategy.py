@@ -10,7 +10,8 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # Strategy entry validity window (IST).
 ENTRY_WINDOW_START = time(9, 35)
-ENTRY_WINDOW_END_EXCLUSIVE = time(11, 0)
+ENTRY_WINDOW_END_EXCLUSIVE = time(12, 0)
+STALE_SIGNAL_MAX_AGE_MINUTES = 8.0
 
 _VALID_DIRECTION_FILTERS = {"ALL", "LONG", "SHORT"}
 _VALID_GRADE_FILTERS = {"ALL", "A_PLUS", "A", "FAILED_OR_CHOP", "NO_TRADE"}
@@ -80,6 +81,31 @@ def _in_early_window(scan_time_value: Any) -> bool:
     if t is None:
         return False
     return ENTRY_WINDOW_START <= t < ENTRY_WINDOW_END_EXCLUSIVE
+
+
+def _time_age_minutes(signal_time_value: Any, reference_time_value: Any) -> Optional[float]:
+    signal_time = _parse_scan_time(signal_time_value)
+    reference_time = _parse_scan_time(reference_time_value)
+    if signal_time is None or reference_time is None:
+        return None
+
+    today = datetime.now(IST).date()
+    signal_dt = datetime.combine(today, signal_time)
+    reference_dt = datetime.combine(today, reference_time)
+    age = (reference_dt - signal_dt).total_seconds() / 60.0
+    if age < 0:
+        return None
+    return round(age, 1)
+
+
+def _signal_freshness(row: Dict[str, Any]) -> Tuple[bool, Optional[float], str]:
+    signal_time = row.get("signal_bar_time", row.get("scan_time"))
+    reference_time = row.get("market_data_last_updated") or row.get("refreshtime") or row.get("refresh_time")
+    age_minutes = _time_age_minutes(signal_time, reference_time)
+    if age_minutes is None:
+        return True, None, "UNKNOWN"
+    is_fresh = age_minutes <= STALE_SIGNAL_MAX_AGE_MINUTES
+    return is_fresh, age_minutes, "FRESH" if is_fresh else "STALE"
 
 
 def _has_text_item(items: Sequence[Any], needle: str) -> bool:
@@ -174,10 +200,59 @@ def _is_failed_or_chop(row: Dict[str, Any], direction: str) -> bool:
     return False
 
 
+def _reversal_guard_flags(row: Dict[str, Any], direction: str) -> List[str]:
+    flags: List[str] = []
+    side = _safe_str(direction).upper()
+    score_change_5m = _safe_float(row.get("score_change_5m"))
+    score_change_10m = _safe_float(row.get("score_change_10m"))
+    weakening_streak = _safe_int(row.get("weakening_streak"))
+    trend_label = _safe_str(row.get("pulse_trend_label")).lower()
+    momentum_decay_pct = _safe_float(row.get("momentum_decay_pct"))
+    improving_now = _safe_bool(row.get("improving_now"), True)
+    direction_confidence = _safe_float(row.get("direction_confidence"))
+    long_consistency = _safe_float(row.get("long_directional_consistency_score"))
+    short_consistency = _safe_float(row.get("short_directional_consistency_score"))
+    directional_consistency = long_consistency if side == "LONG" else short_consistency
+
+    if score_change_5m <= -3.0:
+        flags.append("score_fading_5m")
+    if score_change_10m <= -5.0:
+        flags.append("score_fading_10m")
+    if weakening_streak >= 2:
+        flags.append("weakening_streak")
+    if trend_label == "falling":
+        flags.append("pulse_falling")
+    if momentum_decay_pct >= 8.0:
+        flags.append("momentum_decay")
+    if not improving_now and (score_change_5m < 0 or score_change_10m < 0):
+        flags.append("not_improving")
+    if direction_confidence and direction_confidence < 12.0:
+        flags.append("direction_confidence_low")
+    if directional_consistency and directional_consistency < 45.0:
+        flags.append("directional_consistency_low")
+
+    # Preserve order but avoid repeated reasons.
+    deduped: List[str] = []
+    for flag in flags:
+        if flag not in deduped:
+            deduped.append(flag)
+    return deduped
+
+
+def _has_hard_reversal(reversal_flags: Sequence[str]) -> bool:
+    flags = {str(flag).strip().lower() for flag in reversal_flags}
+    return (
+        "momentum_decay" in flags
+        or ("pulse_falling" in flags and ("score_fading_5m" in flags or "score_fading_10m" in flags))
+        or ("weakening_streak" in flags and ("score_fading_5m" in flags or "score_fading_10m" in flags))
+    )
+
+
 def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     direction = _safe_str(row.get("direction", row.get("trade_side", "NO_TRADE"))).upper()
     scan_time = row.get("scan_time")
     in_early_window = _in_early_window(scan_time)
+    signal_is_fresh, signal_age_minutes, signal_freshness = _signal_freshness(row)
 
     price = _safe_float(row.get("price_at_scan", row.get("ltp")))
     vwap = _safe_float(row.get("vwap"))
@@ -193,6 +268,7 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     reasons = list(row.get("reasons") or [])
     rank_grade = _safe_int(row.get("rank_grade"))
     risks = _major_risk_flags(row)
+    reversal_flags = _reversal_guard_flags(row, direction)
 
     if direction not in {"LONG", "SHORT"}:
         return {
@@ -201,6 +277,9 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "eligible_time_window": in_early_window,
             "score": 0.0,
             "reasons": ["Directional edge clear nahi tha"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
         }
 
     if not in_early_window:
@@ -209,7 +288,22 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "grade": "NO_TRADE",
             "eligible_time_window": False,
             "score": 0.0,
-            "reasons": ["Strategy entry sirf 09:35 ke baad aur 11:00 se pehle valid hogi"],
+            "reasons": ["Strategy entry sirf 09:35 ke baad aur 12:00 se pehle valid hogi"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
+        }
+
+    if not signal_is_fresh:
+        return {
+            "trade_side": "NO_TRADE",
+            "grade": "NO_TRADE",
+            "eligible_time_window": True,
+            "score": 0.0,
+            "reasons": [f"Signal stale hai ({signal_age_minutes}m old); fresh 5-minute bar ka wait karo"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
         }
 
     if _is_failed_or_chop(row, direction):
@@ -219,6 +313,21 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "eligible_time_window": True,
             "score": 0.0,
             "reasons": ["No clean trade / failed setup / chop risk"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
+        }
+
+    if _has_hard_reversal(reversal_flags):
+        return {
+            "trade_side": "NO_TRADE",
+            "grade": "FAILED_OR_CHOP",
+            "eligible_time_window": True,
+            "score": 0.0,
+            "reasons": ["Momentum reverse/fade ho raha hai; fresh continuation ke bina avoid"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
         }
 
     score_used = long_score if direction == "LONG" else short_score
@@ -235,6 +344,7 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             and "long_failed_fast" not in risks
             and "momentum_decay" not in risks
             and "fading_score" not in risks
+            and not reversal_flags
         )
         medium_conviction = (
             structure_ok
@@ -258,6 +368,7 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             and "short_failed_fast" not in risks
             and "momentum_decay" not in risks
             and "fading_score" not in risks
+            and not reversal_flags
         )
         medium_conviction = (
             structure_ok
@@ -290,6 +401,9 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "eligible_time_window": True,
             "score": round(score_used, 1),
             "reasons": output_reasons,
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
         }
 
     if direction == "LONG":
@@ -312,6 +426,8 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             output_reasons.append("Bearish directional intent clear tha")
 
     output_reasons.extend([r for r in reasons if str(r).strip()])
+    if reversal_flags:
+        output_reasons.append("Soft fade warning: " + ", ".join(reversal_flags))
 
     return {
         "trade_side": direction,
@@ -319,6 +435,9 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
         "eligible_time_window": True,
         "score": round(score_used, 1),
         "reasons": output_reasons,
+        "signal_freshness": signal_freshness,
+        "signal_age_minutes": signal_age_minutes,
+        "reversal_flags": reversal_flags,
     }
 
 
@@ -471,13 +590,28 @@ def _seed_reasons_from_pulse_row(row: Dict[str, Any]) -> List[str]:
     return reasons
 
 
-def _prepare_strategy_input_row(row: Dict[str, Any], trade_date: str) -> Dict[str, Any]:
+def _prepare_strategy_input_row(row: Dict[str, Any], trade_date: str, reference_time: str = "") -> Dict[str, Any]:
     prepared = dict(row)
     direction = _safe_str(row.get("direction")).upper()
     failed_fast = _derive_failed_fast(row)
+    signal_bar_time = _safe_str(row.get("latest_bar_time", row.get("scan_time")))
+    refresh_time = _safe_str(reference_time) or datetime.now(IST).strftime("%H:%M:%S")
+    signal_is_fresh, signal_age_minutes, signal_freshness = _signal_freshness(
+        {
+            "signal_bar_time": signal_bar_time,
+            "market_data_last_updated": refresh_time,
+        }
+    )
     prepared.update(
         {
-            "scan_time": _safe_str(row.get("latest_bar_time", row.get("scan_time"))),
+            "scan_time": signal_bar_time,
+            "signal_bar_time": signal_bar_time,
+            "refreshtime": refresh_time,
+            "refresh_time": refresh_time,
+            "market_data_last_updated": refresh_time,
+            "signal_age_minutes": signal_age_minutes,
+            "signal_freshness": signal_freshness,
+            "signal_is_fresh": signal_is_fresh,
             "trade_date": trade_date,
             "price_at_scan": _safe_float(row.get("ltp", row.get("price_at_scan"))),
             "prev_close": _infer_prev_close_from_pulse_row(row),
@@ -614,10 +748,16 @@ def _entry_state(
     volume_ratio: float,
     range_ratio: float,
     risks: Sequence[str],
+    signal_freshness: str = "UNKNOWN",
+    reversal_flags: Sequence[str] = (),
 ) -> str:
     normalized_grade = _safe_str(grade).upper()
     side = _safe_str(trade_side).upper()
     if normalized_grade not in _ACTIONABLE_GRADES or side not in {"LONG", "SHORT"}:
+        return "CANCEL_SETUP"
+    if _safe_str(signal_freshness).upper() == "STALE":
+        return "CANCEL_SETUP"
+    if _has_hard_reversal(reversal_flags):
         return "CANCEL_SETUP"
     if _safe_str(chase_risk).upper() == "HIGH":
         return "AVOID_CHASE"
@@ -625,6 +765,7 @@ def _entry_state(
         return "ENTER_ON_RETEST"
 
     risk_set = {str(r).strip().lower() for r in (risks or [])}
+    reversal_set = {str(r).strip().lower() for r in (reversal_flags or [])}
     trend_label = _safe_str(pulse_trend_label).lower()
     healthy = (
         _safe_float(momentum_pulse_score) >= 58.0
@@ -635,6 +776,7 @@ def _entry_state(
         and "momentum_decay" not in risk_set
         and "fading_score" not in risk_set
         and "low_consistency" not in risk_set
+        and not reversal_set
     )
     if _safe_str(chase_risk).upper() == "LOW" and healthy:
         return "ENTER_NOW"
@@ -654,6 +796,8 @@ def _execution_rank(
     entry_state: str,
     risks: Sequence[str],
     retest_ok: bool,
+    signal_freshness: str = "UNKNOWN",
+    reversal_flags: Sequence[str] = (),
 ) -> float:
     side = _safe_str(trade_side).upper()
     normalized_grade = _safe_str(grade).upper()
@@ -689,6 +833,10 @@ def _execution_rank(
 
     chase_penalty = {"HIGH": 14.0, "MEDIUM": 7.0, "LOW": 0.0, "NA": 10.0}.get(_safe_str(chase_risk).upper(), 6.0)
     score -= chase_penalty
+    if _safe_str(signal_freshness).upper() == "STALE":
+        score -= 28.0
+    elif _safe_str(signal_freshness).upper() == "UNKNOWN":
+        score -= 4.0
 
     risk_weights = {
         "far_from_vwap": 10.0,
@@ -705,6 +853,21 @@ def _execution_rank(
     risk_set = {str(r).strip().lower() for r in (risks or [])}
     for key, weight in risk_weights.items():
         if key in risk_set:
+            score -= weight
+
+    reversal_weights = {
+        "score_fading_5m": 6.0,
+        "score_fading_10m": 8.0,
+        "weakening_streak": 7.0,
+        "pulse_falling": 8.0,
+        "momentum_decay": 10.0,
+        "not_improving": 4.0,
+        "direction_confidence_low": 6.0,
+        "directional_consistency_low": 5.0,
+    }
+    reversal_set = {str(r).strip().lower() for r in (reversal_flags or [])}
+    for key, weight in reversal_weights.items():
+        if key in reversal_set:
             score -= weight
 
     if side not in {"LONG", "SHORT"}:
@@ -755,6 +918,8 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
     direction_confidence = _safe_float(row.get("direction_confidence"))
     pulse_trend_label = _safe_str(row.get("pulse_trend_label"))
     risks = _major_risk_flags(result)
+    reversal_flags = list(result.get("reversal_flags") or _reversal_guard_flags(row, trade_side))
+    signal_freshness = _safe_str(result.get("signal_freshness", row.get("signal_freshness", "UNKNOWN"))).upper()
 
     retest_ok = _retest_ok(trade_side, price, vwap, or_high, or_low)
     or_stretch = _or_stretch_pct(trade_side, price, or_high, or_low)
@@ -770,6 +935,8 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
         volume_ratio=volume_ratio,
         range_ratio=range_ratio,
         risks=risks,
+        signal_freshness=signal_freshness,
+        reversal_flags=reversal_flags,
     )
     execution_rank = _execution_rank(
         trade_side=trade_side,
@@ -784,8 +951,17 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
         entry_state=entry_state,
         risks=risks,
         retest_ok=retest_ok,
+        signal_freshness=signal_freshness,
+        reversal_flags=reversal_flags,
     )
 
+    result["signal_bar_time"] = _safe_str(row.get("signal_bar_time", result.get("scan_time")))
+    result["refresh_time"] = _safe_str(row.get("refresh_time", row.get("refreshtime")))
+    result["market_data_last_updated"] = _safe_str(row.get("market_data_last_updated", result.get("refresh_time")))
+    result["signal_age_minutes"] = result.get("signal_age_minutes")
+    result["signal_freshness"] = signal_freshness
+    result["signal_is_fresh"] = signal_freshness != "STALE"
+    result["reversal_flags"] = reversal_flags
     result["grade_history"] = grade_history
     result["grade_stability_score"] = stability_score
     result["retest_ok"] = bool(retest_ok)
@@ -834,6 +1010,8 @@ def summarize_strategy(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     enter_now = [r for r in rows if _safe_str(r.get("entry_state")).upper() == "ENTER_NOW"]
     enter_retest = [r for r in rows if _safe_str(r.get("entry_state")).upper() == "ENTER_ON_RETEST"]
     avoid = [r for r in rows if _safe_str(r.get("entry_state")).upper() in {"AVOID_CHASE", "CANCEL_SETUP"}]
+    stale = [r for r in rows if _safe_str(r.get("signal_freshness")).upper() == "STALE"]
+    fresh = [r for r in rows if _safe_str(r.get("signal_freshness")).upper() == "FRESH"]
 
     def avg(items: Sequence[Dict[str, Any]], key: str) -> float:
         vals = [_safe_float(i.get(key)) for i in items if i.get(key) is not None]
@@ -850,9 +1028,12 @@ def summarize_strategy(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "enter_now_count": len(enter_now),
         "enter_on_retest_count": len(enter_retest),
         "avoid_count": len(avoid),
+        "fresh_signal_count": len(fresh),
+        "stale_signal_count": len(stale),
         "avg_volume_ratio": avg(rows, "volume_ratio"),
         "avg_range_ratio": avg(rows, "range_ratio"),
         "avg_execution_rank": avg(rows, "execution_rank"),
+        "avg_signal_age_minutes": avg(rows, "signal_age_minutes"),
         "avg_abs_change_pct": round(
             sum(abs(_safe_float(r.get("change_pct_at_scan", r.get("changepct", r.get("change_pct"))))) for r in rows) / len(rows),
             2
@@ -898,6 +1079,10 @@ def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "symbol": _safe_str(row.get("symbol")),
         "scan_time": _safe_str(row.get("scan_time")),
+        "signal_bar_time": _safe_str(row.get("signal_bar_time", row.get("scan_time"))),
+        "refresh_time": _safe_str(row.get("refresh_time", row.get("refreshtime"))),
+        "signal_age_minutes": row.get("signal_age_minutes"),
+        "signal_freshness": _safe_str(row.get("signal_freshness")),
         "trade_side": _safe_str(row.get("trade_side")),
         "grade": _safe_str(row.get("grade")),
         "entry_state": _safe_str(row.get("entry_state")),
@@ -919,6 +1104,7 @@ def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
         "grade_stability_score": _safe_float(row.get("grade_stability_score")),
         "reasons": list(row.get("reasons") or [])[:6],
         "major_risks": list(row.get("major_risks") or [])[:6],
+        "reversal_flags": list(row.get("reversal_flags") or [])[:6],
     }
 
 
@@ -972,7 +1158,8 @@ def build_live_strategy_payload(
     market_data_last_updated = _safe_str(pulse_result.get("market_data_last_updated", last_updated))
     trade_date = datetime.now(IST).strftime("%Y-%m-%d")
 
-    prepared_rows = [_prepare_strategy_input_row(row, trade_date) for row in pulse_stocks]
+    reference_time = market_data_last_updated or last_updated or datetime.now(IST).strftime("%H:%M:%S")
+    prepared_rows = [_prepare_strategy_input_row(row, trade_date, reference_time=reference_time) for row in pulse_stocks]
     strategy_rows = build_strategy_rows(prepared_rows)
     filtered_rows, normalized_direction, normalized_grade = _filter_strategy_rows(
         strategy_rows,
@@ -1054,4 +1241,3 @@ def build_historical_strategy_payload(
         "available_directions": ["ALL", "LONG", "SHORT"],
         "available_grades": ["ALL", "A_PLUS", "A", "FAILED_OR_CHOP", "NO_TRADE"],
     }
-
