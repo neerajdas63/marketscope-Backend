@@ -19,6 +19,8 @@ STATE_FILE = "momentum_pulse_strategy_review.json"
 REVIEW_CUTOFF_TIME = time(15, 30)
 ACTIONABLE_GRADES = {"A_PLUS", "A"}
 ACTIONABLE_ENTRY_STATES = {"ENTER_NOW", "ENTER_ON_RETEST", "WAIT_CONFIRMATION"}
+SIGNAL_RECORD_START = time(9, 35)
+SIGNAL_RECORD_END_EXCLUSIVE = time(12, 0)
 MAX_STORED_DAYS = 30
 MAX_SIGNALS_PER_DAY = 250
 MAX_REVIEW_DAYS = 20
@@ -150,14 +152,13 @@ def _normalise_signal_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_recordable_signal(row: Dict[str, Any]) -> bool:
     grade = _safe_str(row.get("grade")).upper()
-    entry_state = _safe_str(row.get("entry_state")).upper()
     trade_side = _safe_str(row.get("trade_side")).upper()
-    freshness = _safe_str(row.get("signal_freshness")).upper()
+    signal_time = _parse_time(row.get("signal_bar_time", row.get("scan_time")))
     return (
         trade_side in {"LONG", "SHORT"}
         and grade in ACTIONABLE_GRADES
-        and entry_state in ACTIONABLE_ENTRY_STATES
-        and freshness != "STALE"
+        and signal_time is not None
+        and SIGNAL_RECORD_START <= signal_time < SIGNAL_RECORD_END_EXCLUSIVE
         and _safe_float(row.get("entry_price")) > 0
         and _safe_float(row.get("stop_loss")) > 0
     )
