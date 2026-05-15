@@ -86,12 +86,15 @@ def _parse_time(value: Any) -> Optional[time]:
 
 
 def _load_state() -> Dict[str, Any]:
-    state = load_json_state(STATE_FILE, {"signals": {}})
+    state = load_json_state(STATE_FILE, {"signals": {}, "capture_status": {}})
     if not isinstance(state, dict):
-        return {"signals": {}}
+        return {"signals": {}, "capture_status": {}}
     signals = state.get("signals")
     if not isinstance(signals, dict):
         state["signals"] = {}
+    capture_status = state.get("capture_status")
+    if not isinstance(capture_status, dict):
+        state["capture_status"] = {}
     return state
 
 
@@ -164,17 +167,57 @@ def _is_recordable_signal(row: Dict[str, Any]) -> bool:
     )
 
 
+def _capture_status_from_rows(rows: Sequence[Dict[str, Any]], recordable_count: int) -> Dict[str, Any]:
+    row_list = [row for row in (rows or []) if isinstance(row, dict)]
+    in_window = []
+    a_grade = []
+    a_grade_in_window = []
+    for row in row_list:
+        grade = _safe_str(row.get("grade")).upper()
+        signal_time = _parse_time(row.get("signal_bar_time", row.get("scan_time")))
+        is_in_window = signal_time is not None and SIGNAL_RECORD_START <= signal_time < SIGNAL_RECORD_END_EXCLUSIVE
+        if is_in_window:
+            in_window.append(row)
+        if grade in ACTIONABLE_GRADES:
+            a_grade.append(row)
+        if grade in ACTIONABLE_GRADES and is_in_window:
+            a_grade_in_window.append(row)
+
+    top_reasons = Counter()
+    for row in row_list:
+        top_reasons.update(str(reason) for reason in _as_list(row.get("reasons"))[:2])
+
+    return {
+        "last_capture_at": _now_ist().strftime("%H:%M:%S"),
+        "last_capture_date": _today_ist().isoformat(),
+        "rows_seen": len(row_list),
+        "rows_in_signal_window": len(in_window),
+        "a_or_a_plus_seen": len(a_grade),
+        "a_or_a_plus_in_signal_window": len(a_grade_in_window),
+        "recorded_count": recordable_count,
+        "latest_signal_bar_time": max([_safe_str(row.get("signal_bar_time", row.get("scan_time"))) for row in row_list] or [""]),
+        "top_reasons_seen": [{"reason": reason, "count": count} for reason, count in top_reasons.most_common(5)],
+    }
+
+
 def record_strategy_signals(strategy_payload: Dict[str, Any]) -> None:
     rows = list(strategy_payload.get("rows") or [])
     if not rows:
         return
 
     recordable = [_normalise_signal_row(row) for row in rows if _is_recordable_signal(row)]
-    if not recordable:
-        return
 
     with _STATE_LOCK:
         state = _load_state()
+        capture_status = _capture_status_from_rows(rows, len(recordable))
+        capture_by_date = dict(state.get("capture_status") or {})
+        capture_by_date[_safe_str(capture_status.get("last_capture_date"))] = capture_status
+        state["capture_status"] = capture_by_date
+
+        if not recordable:
+            _save_state(state)
+            return
+
         signals_by_date = dict(state.get("signals") or {})
         for signal in recordable:
             day = _safe_str(signal.get("trade_date"))
@@ -396,6 +439,16 @@ def build_strategy_review_payload(target_date: str = "", days: int = 1, limit: i
     with _STATE_LOCK:
         state = _load_state()
         stored_by_date = dict(state.get("signals") or {})
+        capture_by_date = dict(state.get("capture_status") or {})
+
+    capture_status = {
+        "selected_dates": selected,
+        "by_date": {day: capture_by_date.get(day, {}) for day in selected},
+        "total_recorded_for_selected_dates": sum(
+            len(stored_by_date.get(day, []) or [])
+            for day in selected
+        ),
+    }
 
     signals: List[Dict[str, Any]] = []
     for day in selected:
@@ -414,6 +467,7 @@ def build_strategy_review_payload(target_date: str = "", days: int = 1, limit: i
             "rows": [],
             "total": 0,
             "summary": _summary([]),
+            "capture_status": capture_status,
         }
 
     rows: List[Dict[str, Any]] = []
@@ -457,5 +511,6 @@ def build_strategy_review_payload(target_date: str = "", days: int = 1, limit: i
         "rows": rows,
         "total": len(rows),
         "summary": _summary(rows),
+        "capture_status": capture_status,
         "available_outcomes": ["ALL", "WIN", "LOSS", "OPEN", "FLAT", "NO_DATA"],
     }
