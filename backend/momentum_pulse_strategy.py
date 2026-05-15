@@ -100,7 +100,7 @@ def _time_age_minutes(signal_time_value: Any, reference_time_value: Any) -> Opti
 
 def _signal_freshness(row: Dict[str, Any]) -> Tuple[bool, Optional[float], str]:
     signal_time = row.get("signal_bar_time", row.get("scan_time"))
-    reference_time = row.get("market_data_last_updated") or row.get("refreshtime") or row.get("refresh_time")
+    reference_time = row.get("age_reference_time") or row.get("refreshtime") or row.get("refresh_time") or row.get("market_data_last_updated")
     age_minutes = _time_age_minutes(signal_time, reference_time)
     if age_minutes is None:
         return True, None, "UNKNOWN"
@@ -590,16 +590,22 @@ def _seed_reasons_from_pulse_row(row: Dict[str, Any]) -> List[str]:
     return reasons
 
 
-def _prepare_strategy_input_row(row: Dict[str, Any], trade_date: str, reference_time: str = "") -> Dict[str, Any]:
+def _prepare_strategy_input_row(
+    row: Dict[str, Any],
+    trade_date: str,
+    reference_time: str = "",
+    market_data_time: str = "",
+) -> Dict[str, Any]:
     prepared = dict(row)
     direction = _safe_str(row.get("direction")).upper()
     failed_fast = _derive_failed_fast(row)
     signal_bar_time = _safe_str(row.get("latest_bar_time", row.get("scan_time")))
     refresh_time = _safe_str(reference_time) or datetime.now(IST).strftime("%H:%M:%S")
+    market_time = _safe_str(market_data_time) or refresh_time
     signal_is_fresh, signal_age_minutes, signal_freshness = _signal_freshness(
         {
             "signal_bar_time": signal_bar_time,
-            "market_data_last_updated": refresh_time,
+            "age_reference_time": refresh_time,
         }
     )
     prepared.update(
@@ -608,7 +614,8 @@ def _prepare_strategy_input_row(row: Dict[str, Any], trade_date: str, reference_
             "signal_bar_time": signal_bar_time,
             "refreshtime": refresh_time,
             "refresh_time": refresh_time,
-            "market_data_last_updated": refresh_time,
+            "age_reference_time": refresh_time,
+            "market_data_last_updated": market_time,
             "signal_age_minutes": signal_age_minutes,
             "signal_freshness": signal_freshness,
             "signal_is_fresh": signal_is_fresh,
@@ -957,6 +964,7 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
     result["signal_bar_time"] = _safe_str(row.get("signal_bar_time", result.get("scan_time")))
     result["refresh_time"] = _safe_str(row.get("refresh_time", row.get("refreshtime")))
+    result["age_reference_time"] = _safe_str(row.get("age_reference_time", result.get("refresh_time")))
     result["market_data_last_updated"] = _safe_str(row.get("market_data_last_updated", result.get("refresh_time")))
     result["signal_age_minutes"] = result.get("signal_age_minutes")
     result["signal_freshness"] = signal_freshness
@@ -1081,6 +1089,7 @@ def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
         "scan_time": _safe_str(row.get("scan_time")),
         "signal_bar_time": _safe_str(row.get("signal_bar_time", row.get("scan_time"))),
         "refresh_time": _safe_str(row.get("refresh_time", row.get("refreshtime"))),
+        "age_reference_time": _safe_str(row.get("age_reference_time", row.get("refresh_time"))),
         "signal_age_minutes": row.get("signal_age_minutes"),
         "signal_freshness": _safe_str(row.get("signal_freshness")),
         "trade_side": _safe_str(row.get("trade_side")),
@@ -1158,8 +1167,16 @@ def build_live_strategy_payload(
     market_data_last_updated = _safe_str(pulse_result.get("market_data_last_updated", last_updated))
     trade_date = datetime.now(IST).strftime("%Y-%m-%d")
 
-    reference_time = market_data_last_updated or last_updated or datetime.now(IST).strftime("%H:%M:%S")
-    prepared_rows = [_prepare_strategy_input_row(row, trade_date, reference_time=reference_time) for row in pulse_stocks]
+    reference_time = datetime.now(IST).strftime("%H:%M:%S")
+    prepared_rows = [
+        _prepare_strategy_input_row(
+            row,
+            trade_date,
+            reference_time=reference_time,
+            market_data_time=market_data_last_updated or last_updated,
+        )
+        for row in pulse_stocks
+    ]
     strategy_rows = build_strategy_rows(prepared_rows)
     filtered_rows, normalized_direction, normalized_grade = _filter_strategy_rows(
         strategy_rows,
