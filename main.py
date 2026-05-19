@@ -499,6 +499,7 @@ async def momentum_pulse_strategy_review_endpoint(
             target_date=date,
             days=days,
             limit=limit,
+            scanner_stocks=_get_momentum_scanner_stocks(cache.get() or {}),
         )
     except Exception as exc:
         logger.error("Momentum Pulse Strategy review endpoint error: %s", exc, exc_info=True)

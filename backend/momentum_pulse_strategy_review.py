@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import Counter
 from datetime import date, datetime, timedelta, time
@@ -11,6 +12,7 @@ import pytz
 
 from runtime_state import load_json_state, save_json_state
 from upstox_client import get_intraday_history_batch
+from backend.momentum_pulse_strategy import build_strategy_rows
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,7 @@ SIGNAL_RECORD_END_EXCLUSIVE = time(12, 0)
 MAX_STORED_DAYS = 30
 MAX_SIGNALS_PER_DAY = 250
 MAX_REVIEW_DAYS = 20
+BACKFILL_MAX_SYMBOLS = max(20, int(os.getenv("MPS_REVIEW_BACKFILL_MAX_SYMBOLS", "80")))
 
 _STATE_LOCK = threading.Lock()
 
@@ -246,6 +249,170 @@ def _selected_dates(target_date: str = "", days: int = 1) -> List[str]:
     return [(end - timedelta(days=offset)).isoformat() for offset in range(span - 1, -1, -1)]
 
 
+def _symbols_from_scanner(scanner_stocks: Optional[Sequence[Any]]) -> List[str]:
+    symbols: List[str] = []
+    seen = set()
+    for item in scanner_stocks or []:
+        if isinstance(item, dict):
+            symbol = _safe_str(item.get("symbol"))
+        else:
+            symbol = _safe_str(item)
+        symbol = symbol.replace(".NS", "").upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+        if len(symbols) >= BACKFILL_MAX_SYMBOLS:
+            break
+    return symbols
+
+
+def _intraday_vwap(frame: pd.DataFrame) -> float:
+    if frame is None or frame.empty:
+        return 0.0
+    volume = pd.Series(frame["Volume"], dtype="float64").fillna(0.0)
+    typical = (
+        pd.Series(frame["High"], dtype="float64")
+        + pd.Series(frame["Low"], dtype="float64")
+        + pd.Series(frame["Close"], dtype="float64")
+    ) / 3.0
+    total_volume = float(volume.sum())
+    if total_volume <= 0:
+        return _safe_float(frame["Close"].iloc[-1])
+    return round(float((typical * volume).sum() / total_volume), 2)
+
+
+def _directional_score(frame: pd.DataFrame, side: str) -> float:
+    recent = frame.tail(min(6, len(frame))).copy()
+    if len(recent) < 2:
+        return 0.0
+    close = pd.Series(recent["Close"], dtype="float64")
+    open_ = pd.Series(recent["Open"], dtype="float64")
+    close_diff = close.diff().dropna()
+    if side == "LONG":
+        candle_ratio = float((close > open_).mean())
+        follow_ratio = float((close_diff > 0).mean()) if not close_diff.empty else 0.0
+    else:
+        candle_ratio = float((close < open_).mean())
+        follow_ratio = float((close_diff < 0).mean()) if not close_diff.empty else 0.0
+    return round((candle_ratio * 8.0) + (follow_ratio * 7.0), 1)
+
+
+def _backfill_candidate_row(symbol: str, day: str, session_df: pd.DataFrame, bar_ts: Any) -> Optional[Dict[str, Any]]:
+    upto = session_df[session_df.index <= bar_ts].copy()
+    if len(upto) < 5:
+        return None
+
+    opening = session_df[session_df.index.time <= time(9, 30)]
+    if opening.empty:
+        opening = session_df.head(3)
+    or_high = _safe_float(opening["High"].max())
+    or_low = _safe_float(opening["Low"].min())
+    price = _safe_float(upto["Close"].iloc[-1])
+    vwap = _intraday_vwap(upto)
+    if price <= 0 or vwap <= 0 or or_high <= 0 or or_low <= 0:
+        return None
+
+    vwap_dist = round(((price - vwap) / vwap) * 100.0, 2)
+    direction = "NEUTRAL"
+    if price > or_high and price > vwap and vwap_dist > 0:
+        direction = "LONG"
+    elif price < or_low and price < vwap and vwap_dist < 0:
+        direction = "SHORT"
+    if direction == "NEUTRAL":
+        return None
+    signal_time_text = bar_ts.strftime("%H:%M") if hasattr(bar_ts, "strftime") else _safe_str(bar_ts)
+    try:
+        review_reference_time = (datetime.combine(_parse_date(day) or _today_ist(), _parse_time(signal_time_text) or time(9, 35)) + timedelta(minutes=5)).strftime("%H:%M:%S")
+    except Exception:
+        review_reference_time = signal_time_text
+
+    recent = upto.tail(min(6, len(upto)))
+    avg_volume = _safe_float(recent["Volume"].mean())
+    last_volume = _safe_float(recent["Volume"].iloc[-1])
+    volume_ratio = round(last_volume / avg_volume, 2) if avg_volume > 0 else 1.0
+    candle_ranges = (pd.Series(recent["High"], dtype="float64") - pd.Series(recent["Low"], dtype="float64")).abs()
+    avg_range = _safe_float(candle_ranges.mean())
+    current_range = _safe_float(candle_ranges.iloc[-1])
+    range_ratio = round(current_range / avg_range, 2) if avg_range > 0 else 1.0
+
+    long_score = _directional_score(upto, "LONG")
+    short_score = _directional_score(upto, "SHORT")
+    score_used = long_score if direction == "LONG" else short_score
+    rank_grade = 4 if volume_ratio >= 1.5 and range_ratio >= 1.2 and score_used >= 12 else 3 if score_used >= 9 else 2
+
+    return {
+        "symbol": symbol,
+        "trade_date": day,
+        "scan_time": signal_time_text,
+        "signal_bar_time": signal_time_text,
+        "refresh_time": review_reference_time,
+        "age_reference_time": review_reference_time,
+        "market_data_last_updated": review_reference_time,
+        "price_at_scan": price,
+        "ltp": price,
+        "prev_close": _safe_float(session_df["Open"].iloc[0]),
+        "vwap": vwap,
+        "vwap_distance_pct": vwap_dist,
+        "or_high": or_high,
+        "or_low": or_low,
+        "volume_ratio": volume_ratio,
+        "range_ratio": range_ratio,
+        "direction": direction,
+        "direction_confidence": max(long_score, short_score),
+        "long_score": long_score,
+        "short_score": short_score,
+        "rank_grade": rank_grade,
+        "momentum_pulse_score": min(100.0, round((volume_ratio * 18.0) + (range_ratio * 14.0) + (score_used * 3.0), 1)),
+        "pulse_trend_label": "Rising" if score_used >= 9 else "Flat",
+        "score_change_5m": 0.0,
+        "score_change_10m": 0.0,
+        "weakening_streak": 0,
+        "improving_now": True,
+        "reasons": ["Backfilled from 5-minute candles"],
+        "review_source": "on_demand_backfill",
+    }
+
+
+def _backfill_signals_for_dates(selected: Sequence[str], scanner_stocks: Optional[Sequence[Any]]) -> List[Dict[str, Any]]:
+    symbols = _symbols_from_scanner(scanner_stocks)
+    if not symbols:
+        return []
+
+    output: List[Dict[str, Any]] = []
+    for day in selected:
+        labels = [f"{symbol}.NS" for symbol in symbols]
+        raw = None
+        try:
+            raw = get_intraday_history_batch(labels, from_date=day, to_date=day, interval_minutes=5)
+        except Exception as exc:
+            logger.warning("Strategy review backfill history fetch failed for %s: %s", day, exc)
+            continue
+        if raw is None or raw.empty:
+            continue
+
+        for symbol in symbols:
+            frame = _get_symbol_frame(raw, symbol)
+            if frame.empty:
+                continue
+            session = frame[(frame.index.time >= time(9, 15)) & (frame.index.time <= REVIEW_CUTOFF_TIME)].copy()
+            signal_bars = session[
+                (session.index.time >= SIGNAL_RECORD_START)
+                & (session.index.time < SIGNAL_RECORD_END_EXCLUSIVE)
+            ]
+            for bar_ts in signal_bars.index:
+                row = _backfill_candidate_row(symbol, day, session, bar_ts)
+                if row:
+                    output.append(row)
+
+    strategy_rows = build_strategy_rows(output)
+    return [
+        _normalise_signal_row(row)
+        for row in strategy_rows
+        if _is_recordable_signal(row)
+    ][:MAX_SIGNALS_PER_DAY]
+
+
 def _get_symbol_frame(raw: Optional[pd.DataFrame], symbol: str) -> pd.DataFrame:
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -434,7 +601,12 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def build_strategy_review_payload(target_date: str = "", days: int = 1, limit: int = 200) -> Dict[str, Any]:
+def build_strategy_review_payload(
+    target_date: str = "",
+    days: int = 1,
+    limit: int = 200,
+    scanner_stocks: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
     selected = _selected_dates(target_date, days)
     with _STATE_LOCK:
         state = _load_state()
@@ -453,6 +625,40 @@ def build_strategy_review_payload(target_date: str = "", days: int = 1, limit: i
     signals: List[Dict[str, Any]] = []
     for day in selected:
         signals.extend([dict(item) for item in stored_by_date.get(day, []) if isinstance(item, dict)])
+
+    if not signals:
+        backfilled = _backfill_signals_for_dates(selected, scanner_stocks)
+        if backfilled:
+            with _STATE_LOCK:
+                state = _load_state()
+                signals_by_date = dict(state.get("signals") or {})
+                for signal in backfilled:
+                    day = _safe_str(signal.get("trade_date"))
+                    existing = list(signals_by_date.get(day) or [])
+                    by_id = {
+                        _safe_str(item.get("id")): item
+                        for item in existing
+                        if isinstance(item, dict)
+                    }
+                    by_id[_safe_str(signal.get("id"))] = signal
+                    signals_by_date[day] = list(by_id.values())[-MAX_SIGNALS_PER_DAY:]
+                state["signals"] = signals_by_date
+                _save_state(state)
+                stored_by_date = dict(signals_by_date)
+            signals = [dict(item) for item in backfilled]
+            capture_status["backfill"] = {
+                "status": "used",
+                "signals_generated": len(backfilled),
+                "max_symbols": BACKFILL_MAX_SYMBOLS,
+                "source": "5-minute candles",
+            }
+        else:
+            capture_status["backfill"] = {
+                "status": "empty",
+                "signals_generated": 0,
+                "max_symbols": BACKFILL_MAX_SYMBOLS,
+                "source": "5-minute candles",
+            }
 
     max_limit = min(max(int(limit or 200), 1), 500)
     signals = signals[-max_limit:]
