@@ -567,6 +567,192 @@ def calculate_opening_range_position(
     return or_high, or_low, position_pct, long_score, short_score
 
 
+def calculate_breakout_quality(
+    session_df: pd.DataFrame,
+    or_high: float,
+    or_low: float,
+    live_price: float,
+    prev_close: float,
+    entry_window_start: dt_time = dt_time(9, 35),
+    entry_window_end: dt_time = dt_time(10, 0),
+) -> Dict[str, Any]:
+    """
+    Calculates breakout quality metrics from backtest-proven parameters.
+    Returns dict with all metrics and combined score 0-100.
+    """
+    default = {
+        "breakout_side": "NONE",
+        "breakout_confirmed": False,
+        "breakout_body_pct": 0.0,
+        "vol_spike_at_break": 0.0,
+        "follow_through_confirmed": False,
+        "fake_breakout_detected": False,
+        "or_tightness_pct": 0.0,
+        "pre_break_momentum_pct": 0.0,
+        "market_structure_score": 50.0,
+        "market_structure_direction": "flat",
+        "breakout_quality_score": 0.0,
+    }
+    if session_df is None or session_df.empty or or_high <= or_low or prev_close <= 0:
+        return default
+
+    or_tightness_pct = round(((or_high - or_low) / prev_close) * 100.0, 2)
+    default["or_tightness_pct"] = or_tightness_pct
+
+    breakout_idx: Optional[int] = None
+    breakout_side = "NONE"
+    rows = list(session_df.iterrows())
+    for idx, (ts, row) in enumerate(rows):
+        ts_time = ts.time() if hasattr(ts, "time") else None
+        if ts_time is None or ts_time < entry_window_start or ts_time >= entry_window_end:
+            continue
+        close = _safe_float(row.get("Close"))
+        if close > or_high * 1.001:
+            breakout_idx = idx
+            breakout_side = "LONG"
+            break
+        if close < or_low * 0.999:
+            breakout_idx = idx
+            breakout_side = "SHORT"
+            break
+
+    if breakout_idx is None:
+        if live_price > or_high * 1.001:
+            default["breakout_side"] = "LONG"
+            default["breakout_confirmed"] = True
+        elif live_price < or_low * 0.999:
+            default["breakout_side"] = "SHORT"
+            default["breakout_confirmed"] = True
+        return default
+
+    breakout_row = rows[breakout_idx][1]
+    candle_open = _safe_float(breakout_row.get("Open"))
+    candle_high = _safe_float(breakout_row.get("High"))
+    candle_low = _safe_float(breakout_row.get("Low"))
+    candle_close = _safe_float(breakout_row.get("Close"))
+    candle_range = candle_high - candle_low
+    body_pct = abs(candle_close - candle_open) / candle_range if candle_range > 0 else 0.0
+
+    prior_bars = session_df.iloc[:breakout_idx]
+    avg_prior_volume = _safe_float(prior_bars["Volume"].mean()) if not prior_bars.empty and "Volume" in prior_bars else 0.0
+    breakout_volume = _safe_float(breakout_row.get("Volume"))
+    vol_spike = breakout_volume / avg_prior_volume if avg_prior_volume > 0 else 0.0
+
+    next_bar = session_df.iloc[breakout_idx + 1] if breakout_idx + 1 < len(session_df) else None
+    next_close = _safe_float(next_bar.get("Close")) if next_bar is not None else 0.0
+    if breakout_side == "LONG":
+        follow_through = next_close > or_high * 1.001
+    elif breakout_side == "SHORT":
+        follow_through = next_close < or_low * 0.999
+    else:
+        follow_through = False
+
+    fake_breakout = False
+    next_two = session_df.iloc[breakout_idx + 1:breakout_idx + 3]
+    for _, row in next_two.iterrows():
+        close = _safe_float(row.get("Close"))
+        if breakout_side == "LONG" and close <= or_high:
+            fake_breakout = True
+            break
+        if breakout_side == "SHORT" and close >= or_low:
+            fake_breakout = True
+            break
+
+    pre_break = session_df.iloc[max(0, breakout_idx - 6):breakout_idx]
+    pre_break_momentum_pct = 0.0
+    if len(pre_break) >= 2:
+        first_close = _safe_float(pre_break["Close"].iloc[0])
+        last_close = _safe_float(pre_break["Close"].iloc[-1])
+        if first_close > 0:
+            pre_break_momentum_pct = round(((last_close - first_close) / first_close) * 100.0, 2)
+
+    structure_bars = pre_break.tail(8)
+    bullish_count = 0
+    bearish_count = 0
+    if len(structure_bars) >= 2:
+        for idx in range(1, len(structure_bars)):
+            prev = structure_bars.iloc[idx - 1]
+            curr = structure_bars.iloc[idx]
+            higher_high = _safe_float(curr.get("High")) > _safe_float(prev.get("High"))
+            higher_low = _safe_float(curr.get("Low")) > _safe_float(prev.get("Low"))
+            lower_low = _safe_float(curr.get("Low")) < _safe_float(prev.get("Low"))
+            lower_high = _safe_float(curr.get("High")) < _safe_float(prev.get("High"))
+            if higher_high and higher_low:
+                bullish_count += 1
+            if lower_low and lower_high:
+                bearish_count += 1
+
+    total_structure = max(1, bullish_count + bearish_count)
+    if breakout_side == "LONG":
+        structure_score = 50.0 + ((bullish_count - bearish_count) / total_structure) * 50.0
+    elif breakout_side == "SHORT":
+        structure_score = 50.0 + ((bearish_count - bullish_count) / total_structure) * 50.0
+    else:
+        structure_score = 50.0
+    structure_score = round(max(0.0, min(100.0, structure_score)), 1)
+    if bullish_count > bearish_count:
+        structure_direction = "bullish"
+    elif bearish_count > bullish_count:
+        structure_direction = "bearish"
+    else:
+        structure_direction = "flat"
+
+    body_score = min(body_pct / 1.0, 1.0) * 25.0
+    vol_spike_score = min(vol_spike / 3.0, 1.0) * 20.0
+    if or_tightness_pct <= 1.5:
+        or_tightness_score = 10.0
+    elif or_tightness_pct > 2.5:
+        or_tightness_score = 0.0
+    else:
+        or_tightness_score = max(0.0, (2.5 - or_tightness_pct) / 1.0 * 10.0)
+    quality_score = (
+        (35.0 if follow_through else 0.0)
+        + body_score
+        + vol_spike_score
+        + or_tightness_score
+        + (structure_score / 100.0 * 10.0)
+    )
+
+    return {
+        "breakout_side": breakout_side,
+        "breakout_confirmed": True,
+        "breakout_body_pct": round(body_pct, 3),
+        "vol_spike_at_break": round(vol_spike, 2),
+        "follow_through_confirmed": bool(follow_through),
+        "fake_breakout_detected": bool(fake_breakout),
+        "or_tightness_pct": or_tightness_pct,
+        "pre_break_momentum_pct": pre_break_momentum_pct,
+        "market_structure_score": structure_score,
+        "market_structure_direction": structure_direction,
+        "breakout_quality_score": round(max(0.0, min(100.0, quality_score)), 1),
+    }
+
+
+def calculate_nifty_alignment_score(
+    direction: str,
+    nifty_change_pct: float,
+) -> float:
+    """
+    Score 0-100 based on whether trade direction aligns with Nifty.
+    Backtest showed misaligned trades had much higher loss rate.
+    """
+    side = str(direction or "").upper()
+    nifty_change = _safe_float(nifty_change_pct)
+    if side == "LONG":
+        if nifty_change > 0.3:
+            return 85.0
+        if nifty_change < -0.3:
+            return 20.0
+        return 50.0
+    if side == "SHORT":
+        if nifty_change < -0.3:
+            return 85.0
+        if nifty_change > 0.3:
+            return 20.0
+        return 50.0
+    return 50.0
+
+
 def calculate_oi_confirmation(oi_data: Optional[Dict[str, Any]]) -> Tuple[float, float, str]:
     """OI-based directional confirmation. Returns (long_score, short_score, oi_signal)."""
     if not oi_data:
@@ -839,9 +1025,12 @@ def _build_warning_flags(
     pulse_trend_label: str,
     volume_pace_ratio: float,
     is_extended: bool,
+    breakout_quality: Optional[Dict[str, Any]] = None,
+    nifty_alignment_score: float = 50.0,
 ) -> List[str]:
     warning_flags: List[str] = []
     consistency_score = long_consistency if direction == "LONG" else short_consistency if direction == "SHORT" else max(long_consistency, short_consistency)
+    breakout_quality = breakout_quality or {}
 
     if is_extended or abs(distance_from_vwap_pct) >= 1.4:
         warning_flags.append("far_from_vwap")
@@ -855,6 +1044,16 @@ def _build_warning_flags(
         warning_flags.append("fading_score")
     if volume_pace_ratio < 1.0:
         warning_flags.append("low_volume_confirmation")
+    if breakout_quality.get("fake_breakout_detected") is True:
+        warning_flags.append("fake_breakout_risk")
+    if breakout_quality.get("breakout_confirmed") and not breakout_quality.get("follow_through_confirmed"):
+        warning_flags.append("no_follow_through")
+    if _safe_float(breakout_quality.get("breakout_body_pct")) < 0.5:
+        warning_flags.append("weak_breakout_candle")
+    if _safe_float(nifty_alignment_score) <= 25:
+        warning_flags.append("nifty_diverging")
+    if _safe_float(breakout_quality.get("or_tightness_pct")) > 2.0:
+        warning_flags.append("wide_or_range")
     return warning_flags
 
 
@@ -972,6 +1171,25 @@ def _evaluate_symbol(
     or_high, or_low, or_position_pct, long_or_score, short_or_score = calculate_opening_range_position(
         session_df, live_price,
     )
+    breakout_quality = calculate_breakout_quality(
+        session_df,
+        or_high,
+        or_low,
+        live_price,
+        current_prev_close,
+    )
+    breakout_side = str(breakout_quality.get("breakout_side") or "NONE").upper()
+    market_structure_score = _safe_float(breakout_quality.get("market_structure_score"), 50.0)
+    if breakout_side == "LONG":
+        long_structure_score = market_structure_score
+        short_structure_score = 100.0 - market_structure_score
+    elif breakout_side == "SHORT":
+        long_structure_score = 100.0 - market_structure_score
+        short_structure_score = market_structure_score
+    else:
+        long_structure_score = short_structure_score = 50.0
+    long_nifty_alignment_score = calculate_nifty_alignment_score("LONG", nifty_change_pct)
+    short_nifty_alignment_score = calculate_nifty_alignment_score("SHORT", nifty_change_pct)
     symbol_clean = str(stock.get("symbol") or "").upper()
     is_fo = symbol_clean in _FO_STOCKS
     oi_data = (oi_cache or {}).get(symbol_clean, {}) if is_fo else {}
@@ -981,12 +1199,16 @@ def _evaluate_symbol(
 
     # ── Dynamic weight system (auto-normalizes when OI/sector unavailable) ───
     long_components = [
-        (volume_pace_score, 22), (vol_consistency_score, 8), (range_expansion_score, 18),
-        (long_rs_score, 12), (long_consistency, 8), (long_vwap_score, 5), (long_or_score, 5),
+        (breakout_quality["breakout_quality_score"], 15), (long_nifty_alignment_score, 8),
+        (long_structure_score, 10), (volume_pace_score, 22), (vol_consistency_score, 6),
+        (range_expansion_score, 18), (long_rs_score, 12), (long_consistency, 8),
+        (long_vwap_score, 3), (long_or_score, 3),
     ]
     short_components = [
-        (volume_pace_score, 22), (vol_consistency_score, 8), (range_expansion_score, 18),
-        (short_rs_score, 12), (short_consistency, 8), (short_vwap_score, 5), (short_or_score, 5),
+        (breakout_quality["breakout_quality_score"], 15), (short_nifty_alignment_score, 8),
+        (short_structure_score, 10), (volume_pace_score, 22), (vol_consistency_score, 6),
+        (range_expansion_score, 18), (short_rs_score, 12), (short_consistency, 8),
+        (short_vwap_score, 3), (short_or_score, 3),
     ]
     if has_sector:
         long_components.append((long_sector_score, 8))
@@ -1068,6 +1290,7 @@ def _evaluate_symbol(
         pulse_trend_label = str(committed_trend.get("pulse_trend_label", "Flat"))
 
     selected_rs_score = long_rs_score if direction == "LONG" else short_rs_score if direction == "SHORT" else max(long_rs_score, short_rs_score)
+    nifty_alignment_score = calculate_nifty_alignment_score(direction, nifty_change_pct)
     warning_flags = _build_warning_flags(
         direction,
         distance_from_vwap_pct,
@@ -1078,6 +1301,8 @@ def _evaluate_symbol(
         pulse_trend_label,
         volume_pace_ratio,
         is_extended,
+        breakout_quality,
+        nifty_alignment_score,
     )
     behavior_state = _classify_behavior_state(
         latest_ts=latest_ts,
@@ -1130,6 +1355,21 @@ def _evaluate_symbol(
         quality_tags.append("or_breakout")
     if volume_pace_ratio >= 1.5 and vol_consistency_score >= 60:
         quality_tags.append("strong_accumulation")
+    if (
+        _safe_float(breakout_quality.get("breakout_body_pct")) >= 0.75
+        and breakout_quality.get("follow_through_confirmed")
+        and _safe_float(breakout_quality.get("vol_spike_at_break")) >= 1.5
+    ):
+        quality_tags.append("strong_breakout")
+    if nifty_alignment_score >= 75:
+        quality_tags.append("nifty_aligned")
+    if _safe_float(breakout_quality.get("or_tightness_pct")) <= 1.2 and breakout_quality.get("breakout_confirmed"):
+        quality_tags.append("tight_or")
+    market_structure_direction = str(breakout_quality.get("market_structure_direction") or "flat").lower()
+    if (market_structure_direction == "bullish" and direction == "LONG") or (
+        market_structure_direction == "bearish" and direction == "SHORT"
+    ):
+        quality_tags.append("structure_aligned")
 
     # Re-evaluate tier after decay
     tier = get_tier(momentum_pulse_score)
@@ -1163,6 +1403,19 @@ def _evaluate_symbol(
         "opening_range_position_pct": round(or_position_pct, 1),
         "long_opening_range_score": round(long_or_score, 1),
         "short_opening_range_score": round(short_or_score, 1),
+        "breakout_confirmed": breakout_quality["breakout_confirmed"],
+        "breakout_side": breakout_quality["breakout_side"],
+        "breakout_body_pct": breakout_quality["breakout_body_pct"],
+        "vol_spike_at_break": breakout_quality["vol_spike_at_break"],
+        "follow_through_confirmed": breakout_quality["follow_through_confirmed"],
+        "fake_breakout_detected": breakout_quality["fake_breakout_detected"],
+        "or_tightness_pct": breakout_quality["or_tightness_pct"],
+        "pre_break_momentum_pct": breakout_quality["pre_break_momentum_pct"],
+        "market_structure_score": breakout_quality["market_structure_score"],
+        "market_structure_direction": breakout_quality["market_structure_direction"],
+        "breakout_quality_score": breakout_quality["breakout_quality_score"],
+        "nifty_alignment_score": nifty_alignment_score,
+        "nifty_change_pct": nifty_change_pct,
         "is_fo_stock": is_fo,
         "oi_signal": oi_signal if is_fo else "",
         "long_oi_confirmation_score": round(long_oi_score, 1) if has_oi else None,
@@ -1463,3 +1716,31 @@ def get_momentum_pulse(
         "status": status,
         "message": cache_error or ("Momentum Pulse cache is warming up" if not has_completed else "Momentum Pulse refresh is running in background" if has_any_cached_results and should_refresh else "No discovery names matched the current filters yet" if not has_any_cached_results else ""),
     }
+
+
+def get_daily_best_stock(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    From momentum pulse results, find the single best stock for the day.
+    Based on backtest: 9/10 days had a clear winner with these exact criteria.
+    """
+    candidates = [
+        row for row in (results or [])
+        if _safe_float(row.get("volume_pace_ratio", row.get("volume_ratio"))) >= 2.0
+        and abs(_safe_float(row.get("relative_strength", row.get("change_pct_at_scan", row.get("change_pct"))))) >= 1.5
+        and _safe_float(row.get("breakout_quality_score")) >= 70.0
+        and str(row.get("fake_breakout_detected", False)).strip().lower() not in {"1", "true", "yes"}
+        and _safe_float(row.get("nifty_alignment_score"), 50.0) >= 60.0
+        and str(row.get("follow_through_confirmed", False)).strip().lower() in {"1", "true", "yes"}
+        and str(row.get("direction", row.get("trade_side"))).upper() in {"LONG", "SHORT"}
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda row: (
+            _safe_float(row.get("breakout_quality_score")),
+            _safe_float(row.get("volume_pace_ratio", row.get("volume_ratio"))),
+            abs(_safe_float(row.get("relative_strength", row.get("change_pct_at_scan", row.get("change_pct"))))),
+        ),
+        reverse=True,
+    )
+    return candidates[0]

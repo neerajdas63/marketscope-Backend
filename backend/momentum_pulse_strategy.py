@@ -170,6 +170,20 @@ def _major_risk_flags(row: Dict[str, Any]) -> List[str]:
         risks.append("fading_score")
     if _has_text_item(warning_flags, "lowvolumeconfirmation") or _has_text_item(warning_flags, "low_volume_confirmation"):
         risks.append("low_volume_confirmation")
+    if _safe_bool(row.get("fake_breakout_detected")) or _has_text_item(warning_flags, "fake_breakout_risk"):
+        risks.append("fake_breakout_risk")
+    if (
+        (_safe_bool(row.get("breakout_confirmed")) and not _safe_bool(row.get("follow_through_confirmed")))
+        or _has_text_item(warning_flags, "no_follow_through")
+    ):
+        risks.append("no_follow_through")
+    body_pct = _safe_float(row.get("breakout_body_pct"))
+    if (body_pct < 0.5 and body_pct > 0) or _has_text_item(warning_flags, "weak_breakout_candle"):
+        risks.append("weak_breakout_candle")
+    if _safe_float(row.get("nifty_alignment_score"), 50.0) <= 25 or _has_text_item(warning_flags, "nifty_diverging"):
+        risks.append("nifty_diverging")
+    if _safe_float(row.get("or_tightness_pct")) > 2.0 or _has_text_item(warning_flags, "wide_or_range"):
+        risks.append("wide_or_range")
 
     behavior_state = _safe_str(row.get("behaviorstate", row.get("behavior_state"))).upper()
     if behavior_state == "EXTENDED":
@@ -330,6 +344,31 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "reversal_flags": reversal_flags,
         }
 
+    if _safe_bool(row.get("fake_breakout_detected")):
+        return {
+            "trade_side": "NO_TRADE",
+            "grade": "FAILED_OR_CHOP",
+            "eligible_time_window": in_early_window,
+            "score": 0.0,
+            "reasons": ["Fake breakout detected - price crossed OR then reversed"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
+        }
+
+    nifty_alignment = _safe_float(row.get("nifty_alignment_score", 50.0))
+    if nifty_alignment <= 20:
+        return {
+            "trade_side": "NO_TRADE",
+            "grade": "NO_TRADE",
+            "eligible_time_window": in_early_window,
+            "score": 0.0,
+            "reasons": ["Nifty moving strongly against trade direction"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
+        }
+
     score_used = long_score if direction == "LONG" else short_score
 
     if direction == "LONG":
@@ -341,6 +380,10 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             and 0.20 <= vwap_dist <= 1.20
             and score_used >= 12
             and rank_grade >= 4
+            and _safe_float(row.get("breakout_body_pct", 0.5)) >= 0.60
+            and not _safe_bool(row.get("fake_breakout_detected"))
+            and _safe_float(row.get("nifty_alignment_score", 50)) >= 55
+            and (not _safe_bool(row.get("breakout_confirmed")) or _safe_bool(row.get("follow_through_confirmed")))
             and "long_failed_fast" not in risks
             and "momentum_decay" not in risks
             and "fading_score" not in risks
@@ -353,6 +396,8 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             and 0.15 <= vwap_dist <= 1.30
             and score_used >= 9
             and rank_grade >= 3
+            and not _safe_bool(row.get("fake_breakout_detected"))
+            and _safe_float(row.get("nifty_alignment_score", 50)) >= 40
             and "long_failed_fast" not in risks
             and "momentum_decay" not in risks
         )
@@ -365,6 +410,10 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             and -1.20 <= vwap_dist <= -0.20
             and score_used >= 12
             and rank_grade >= 4
+            and _safe_float(row.get("breakout_body_pct", 0.5)) >= 0.60
+            and not _safe_bool(row.get("fake_breakout_detected"))
+            and _safe_float(row.get("nifty_alignment_score", 50)) >= 55
+            and (not _safe_bool(row.get("breakout_confirmed")) or _safe_bool(row.get("follow_through_confirmed")))
             and "short_failed_fast" not in risks
             and "momentum_decay" not in risks
             and "fading_score" not in risks
@@ -377,6 +426,8 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             and -1.30 <= vwap_dist <= -0.15
             and score_used >= 9
             and rank_grade >= 3
+            and not _safe_bool(row.get("fake_breakout_detected"))
+            and _safe_float(row.get("nifty_alignment_score", 50)) >= 40
             and "short_failed_fast" not in risks
             and "momentum_decay" not in risks
         )
@@ -387,6 +438,21 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
         grade = "A"
     else:
         grade = "NO_TRADE"
+
+    scan_time_obj = _parse_scan_time(scan_time)
+    if scan_time_obj and grade in {"A_PLUS", "A"}:
+        or_window = time(9, 35) <= scan_time_obj < time(10, 0)
+        trend_window = time(10, 0) <= scan_time_obj < time(12, 0)
+
+        if or_window and not _safe_bool(row.get("breakout_confirmed")):
+            grade = "A" if grade == "A_PLUS" else "NO_TRADE"
+
+        if trend_window:
+            pulse_trend = _safe_str(row.get("pulse_trend_label")).lower()
+            if pulse_trend != "rising" or "momentum_decay" in risks:
+                grade = "NO_TRADE"
+            if grade == "A_PLUS" and volume_ratio < 2.0:
+                grade = "A"
 
     output_reasons: List[str] = []
 
@@ -539,14 +605,36 @@ def _infer_prev_close_from_pulse_row(row: Dict[str, Any]) -> float:
 
 def _derive_rank_grade(row: Dict[str, Any]) -> int:
     score = _safe_float(row.get("momentum_pulse_score"))
-    rank = max(1, _safe_int(row.get("rank"), 9999))
     tier = _safe_str(row.get("tier")).lower()
     volume_ratio = _safe_float(row.get("volume_pace_ratio", row.get("volume_ratio")))
-    trend_strength = _safe_float(row.get("pulse_trend_strength"))
+    breakout_quality = _safe_float(row.get("breakout_quality_score"))
+    follow_through = _safe_bool(row.get("follow_through_confirmed"))
+    fake_detected = _safe_bool(row.get("fake_breakout_detected"))
+    nifty_aligned = _safe_float(row.get("nifty_alignment_score", 50.0))
+    body_pct = _safe_float(row.get("breakout_body_pct"))
 
-    if score >= 72 and rank <= 12 and tier == "strong" and volume_ratio >= 1.2:
+    if fake_detected:
+        return 1
+    if "no_follow_through" in str(row.get("warning_flags", [])):
+        return max(1, 2)
+
+    if (
+        score >= 65
+        and tier in {"strong", "moderate"}
+        and volume_ratio >= 2.0
+        and breakout_quality >= 70
+        and follow_through
+        and nifty_aligned >= 60
+        and body_pct >= 0.65
+    ):
         return 4
-    if score >= 58 and rank <= 30 and tier in {"strong", "moderate"} and trend_strength >= 18:
+    if (
+        score >= 55
+        and tier in {"strong", "moderate"}
+        and volume_ratio >= 1.2
+        and breakout_quality >= 50
+        and not fake_detected
+    ):
         return 3
     if score >= 45 or tier == "weak":
         return 2
@@ -587,6 +675,22 @@ def _seed_reasons_from_pulse_row(row: Dict[str, Any]) -> List[str]:
         reasons.append("Opening range confirmation")
     if "strong_accumulation" in quality_tags:
         reasons.append("Participation broad tha")
+    if _safe_bool(row.get("follow_through_confirmed")):
+        reasons.append("Follow-through confirmed - next candle held beyond OR")
+    body_pct = _safe_float(row.get("breakout_body_pct"))
+    if body_pct >= 0.75:
+        reasons.append(f"Strong breakout candle body ({round(body_pct * 100)}% of range)")
+    vol_spike = _safe_float(row.get("vol_spike_at_break"))
+    if vol_spike >= 1.5:
+        reasons.append(f"Volume spike {round(vol_spike, 1)}x at breakout candle")
+    nifty_score = _safe_float(row.get("nifty_alignment_score", 50))
+    if nifty_score >= 75:
+        reasons.append("Nifty moving in same direction - wind at back")
+    if _safe_bool(row.get("fake_breakout_detected")):
+        reasons.append("WARNING: Fake breakout detected - avoid this trade")
+    ms_dir = _safe_str(row.get("market_structure_direction"))
+    if (ms_dir == "bullish" and direction == "LONG") or (ms_dir == "bearish" and direction == "SHORT"):
+        reasons.append(f"Market structure aligned ({ms_dir}) with trade direction")
     return reasons
 
 
@@ -805,21 +909,38 @@ def _execution_rank(
     retest_ok: bool,
     signal_freshness: str = "UNKNOWN",
     reversal_flags: Sequence[str] = (),
+    breakout_quality_score: float = 0.0,
+    nifty_alignment_score: float = 50.0,
+    follow_through: bool = False,
+    fake_breakout: bool = False,
 ) -> float:
     side = _safe_str(trade_side).upper()
     normalized_grade = _safe_str(grade).upper()
 
-    grade_points = {"A_PLUS": 32.0, "A": 24.0, "FAILED_OR_CHOP": 8.0, "NO_TRADE": 0.0}.get(normalized_grade, 0.0)
-    momentum_component = max(0.0, min(100.0, _safe_float(momentum_pulse_score))) * 0.35
-    stability_component = max(0.0, min(100.0, _safe_float(grade_stability_score))) * 0.18
-    confidence_component = max(0.0, min(100.0, _safe_float(direction_confidence))) * 0.08
+    grade_points = {"A_PLUS": 28.0, "A": 20.0, "FAILED_OR_CHOP": 8.0, "NO_TRADE": 0.0}.get(normalized_grade, 0.0)
+    momentum_component = max(0.0, min(100.0, _safe_float(momentum_pulse_score))) * 0.20
+    breakout_component = max(0.0, min(100.0, _safe_float(breakout_quality_score))) * 0.22
+    stability_component = max(0.0, min(100.0, _safe_float(grade_stability_score))) * 0.15
+    nifty_component = max(0.0, min(100.0, _safe_float(nifty_alignment_score, 50.0))) * 0.10
+    confidence_component = max(0.0, min(100.0, _safe_float(direction_confidence))) * 0.06
 
     vol = max(0.0, min(3.0, _safe_float(volume_ratio)))
     rng = max(0.0, min(3.0, _safe_float(range_ratio)))
-    volume_component = (vol / 3.0) * 10.0
+    volume_component = (vol / 3.0) * 12.0
     range_component = (rng / 3.0) * 8.0
 
-    score = grade_points + momentum_component + stability_component + confidence_component + volume_component + range_component
+    score = (
+        grade_points
+        + momentum_component
+        + breakout_component
+        + stability_component
+        + nifty_component
+        + confidence_component
+        + volume_component
+        + range_component
+    )
+    if follow_through:
+        score += 10.0
     if retest_ok:
         score += 4.0
 
@@ -845,6 +966,18 @@ def _execution_rank(
     elif _safe_str(signal_freshness).upper() == "UNKNOWN":
         score -= 4.0
 
+    risk_set = {str(r).strip().lower() for r in (risks or [])}
+    if fake_breakout:
+        score -= 25.0
+    if "no_follow_through" in risk_set:
+        score -= 12.0
+    if "nifty_diverging" in risk_set:
+        score -= 10.0
+    if "weak_breakout_candle" in risk_set:
+        score -= 6.0
+    if "wide_or_range" in risk_set:
+        score -= 5.0
+
     risk_weights = {
         "far_from_vwap": 10.0,
         "momentum_decay": 7.0,
@@ -857,7 +990,6 @@ def _execution_rank(
         "long_failed_fast": 10.0,
         "short_failed_fast": 10.0,
     }
-    risk_set = {str(r).strip().lower() for r in (risks or [])}
     for key, weight in risk_weights.items():
         if key in risk_set:
             score -= weight
@@ -879,6 +1011,8 @@ def _execution_rank(
 
     if side not in {"LONG", "SHORT"}:
         score -= 10.0
+    if "no_follow_through" in risk_set:
+        score = min(score, 50.0)
 
     return round(max(0.0, min(100.0, score)), 2)
 
@@ -924,6 +1058,10 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
     range_ratio = _safe_float(result.get("range_ratio"))
     direction_confidence = _safe_float(row.get("direction_confidence"))
     pulse_trend_label = _safe_str(row.get("pulse_trend_label"))
+    breakout_quality_score = _safe_float(row.get("breakout_quality_score"))
+    nifty_alignment_score = _safe_float(row.get("nifty_alignment_score", 50.0))
+    follow_through = _safe_bool(row.get("follow_through_confirmed"))
+    fake_breakout = _safe_bool(row.get("fake_breakout_detected"))
     risks = _major_risk_flags(result)
     reversal_flags = list(result.get("reversal_flags") or _reversal_guard_flags(row, trade_side))
     signal_freshness = _safe_str(result.get("signal_freshness", row.get("signal_freshness", "UNKNOWN"))).upper()
@@ -960,6 +1098,10 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
         retest_ok=retest_ok,
         signal_freshness=signal_freshness,
         reversal_flags=reversal_flags,
+        breakout_quality_score=breakout_quality_score,
+        nifty_alignment_score=nifty_alignment_score,
+        follow_through=follow_through,
+        fake_breakout=fake_breakout,
     )
 
     result["signal_bar_time"] = _safe_str(row.get("signal_bar_time", result.get("scan_time")))
@@ -1100,6 +1242,13 @@ def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
         "vwap_distance_pct": _safe_float(row.get("vwap_distance_pct")),
         "volume_ratio": _safe_float(row.get("volume_ratio")),
         "range_ratio": _safe_float(row.get("range_ratio")),
+        "breakout_quality_score": _safe_float(row.get("breakout_quality_score")),
+        "breakout_body_pct": _safe_float(row.get("breakout_body_pct")),
+        "vol_spike_at_break": _safe_float(row.get("vol_spike_at_break")),
+        "follow_through_confirmed": _safe_bool(row.get("follow_through_confirmed")),
+        "fake_breakout_detected": _safe_bool(row.get("fake_breakout_detected")),
+        "nifty_alignment_score": _safe_float(row.get("nifty_alignment_score", 50.0)),
+        "or_tightness_pct": _safe_float(row.get("or_tightness_pct")),
         "entry_price": row.get("entry_price"),
         "stop_loss": row.get("stop_loss"),
         "target_1": row.get("target_1"),
@@ -1128,6 +1277,15 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         )
 
     actionable_rows = [r for r in ordered if actionable(r)]
+    daily_best_candidates = [
+        r for r in ordered
+        if _safe_float(r.get("volume_ratio")) >= 2.0
+        and abs(_safe_float(r.get("change_pct_at_scan", r.get("change_pct")))) >= 1.0
+        and _safe_float(r.get("breakout_quality_score", 0)) >= 70
+        and not _safe_bool(r.get("fake_breakout_detected"))
+        and _safe_str(r.get("trade_side")).upper() in {"LONG", "SHORT"}
+        and _safe_str(r.get("grade")).upper() in {"A_PLUS", "A"}
+    ]
 
     overall_best = [_thin_row_for_bucket(r) for r in actionable_rows[:8]]
     best_longs = [
@@ -1149,6 +1307,7 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     ][:12]
 
     return {
+        "daily_best": _thin_row_for_bucket(daily_best_candidates[0]) if daily_best_candidates else None,
         "overall_best": overall_best,
         "best_longs": best_longs,
         "best_shorts": best_shorts,
