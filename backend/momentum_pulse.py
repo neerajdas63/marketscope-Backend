@@ -20,6 +20,7 @@ from nse_fetcher import fetch_nse_index_quotes
 from runtime_state import load_json_state, save_json_state
 from upstox_client import get_intraday_history_batch, get_underlying_snapshot
 from stocks import SECTORS as _HEATMAP_SECTORS, FO_STOCKS as _FO_STOCKS
+from market_context import get_combined_market_filter, get_market_breadth, get_nifty_market_state
 
 logger = logging.getLogger("momentum_pulse")
 
@@ -195,6 +196,32 @@ def _download_intraday_batch(symbols_ns: Sequence[str]) -> Optional[pd.DataFrame
     from_date = (datetime.now(IST).date() - pd.Timedelta(days=MOMENTUM_PULSE_HISTORY_CALENDAR_DAYS)).isoformat()
     to_date = datetime.now(IST).date().isoformat()
     return _download_intraday_batch_for_range(symbols_ns, from_date=from_date, to_date=to_date)
+
+
+def _get_nifty_5m_df() -> Optional[pd.DataFrame]:
+    """Fetch last 10 calendar days of Nifty 5-minute bars using the same normalized history path."""
+    from_date = (datetime.now(IST).date() - pd.Timedelta(days=10)).isoformat()
+    to_date = datetime.now(IST).date().isoformat()
+    raw = _download_intraday_batch_for_range(["^NSEI"], from_date=from_date, to_date=to_date)
+    nifty_df = _get_sym_df(raw, "^NSEI")
+    if nifty_df is not None and not nifty_df.empty:
+        return nifty_df
+
+    try:
+        raw = yf.download(
+            tickers="^NSEI",
+            start=from_date,
+            end=(pd.Timestamp(to_date) + pd.Timedelta(days=1)).date().isoformat(),
+            interval="5m",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=15,
+        )
+        return _get_sym_df(raw, "^NSEI")
+    except Exception as exc:
+        logger.warning("Momentum Pulse Nifty 5m context fetch failed: %s", exc)
+        return None
 
 
 def _pulse_candidate_priority(stock: Dict[str, Any]) -> float:
@@ -1457,6 +1484,66 @@ def _evaluate_symbol(
     }
 
 
+def _apply_market_filter_to_results(
+    results: List[Dict[str, Any]],
+    market_filter: Dict[str, Any],
+    breadth: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    updated: List[Dict[str, Any]] = []
+    quality_multiplier = _safe_float(market_filter.get("quality_multiplier"), 1.0)
+    skip_day = bool(market_filter.get("skip_day"))
+    allow_long = bool(market_filter.get("allow_long", True))
+    allow_short = bool(market_filter.get("allow_short", True))
+    preferred_side = str(market_filter.get("preferred_side") or "BOTH").upper()
+    min_rs_for_long = _safe_float(market_filter.get("min_rs_for_long"), 0.5)
+    min_rs_for_short = _safe_float(market_filter.get("min_rs_for_short"), -0.5)
+
+    for row in results:
+        item = dict(row)
+        direction = str(item.get("direction") or "").upper()
+        relative_strength = _safe_float(item.get("relative_strength"))
+        warning_flags = list(item.get("warning_flags") or [])
+        market_filter_passed = True
+
+        if skip_day:
+            warning_flags.append("skip_day_choppy")
+            market_filter_passed = False
+        elif direction == "LONG":
+            if not allow_long or relative_strength < min_rs_for_long:
+                warning_flags.append("market_against_long")
+                item["momentum_pulse_score"] = round(max(0.0, _safe_float(item.get("momentum_pulse_score")) - 8.0), 1)
+                market_filter_passed = False
+        elif direction == "SHORT":
+            if not allow_short or relative_strength > min_rs_for_short:
+                warning_flags.append("market_against_short")
+                item["momentum_pulse_score"] = round(max(0.0, _safe_float(item.get("momentum_pulse_score")) - 8.0), 1)
+                market_filter_passed = False
+
+        if preferred_side == "LONG" and direction == "SHORT" and relative_strength > -2.0:
+            if "market_against_short" not in warning_flags:
+                warning_flags.append("market_against_short")
+            market_filter_passed = False
+        if preferred_side == "SHORT" and direction == "LONG" and relative_strength < 2.0:
+            if "market_against_long" not in warning_flags:
+                warning_flags.append("market_against_long")
+            market_filter_passed = False
+
+        adjusted_score = _safe_float(item.get("momentum_pulse_score")) * quality_multiplier
+        item["momentum_pulse_score"] = round(max(0.0, min(100.0, adjusted_score)), 1)
+        item["tier"] = get_tier(_safe_float(item.get("momentum_pulse_score")))
+        item["warning_flags"] = list(dict.fromkeys(warning_flags))
+        item["market_mode"] = market_filter.get("market_mode", "")
+        item["market_confidence"] = round(_safe_float(market_filter.get("confidence")), 1)
+        item["market_filter_passed"] = bool(market_filter_passed)
+        item["market_breadth_signal"] = breadth.get("breadth_signal", "NEUTRAL")
+        item["market_preferred_side"] = preferred_side
+        item["market_skip_day"] = bool(skip_day)
+        item["market_filter_reason"] = market_filter.get("reason", "")
+        updated.append(item)
+
+    return updated
+
+
 def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
     candidate_stocks = _select_candidate_scanner_stocks(scanner_stocks)
     symbols_ns = []
@@ -1472,6 +1559,16 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
         return [], 0.0
 
     benchmark_change_pct = _nifty_change_from_sources(None)
+    try:
+        nifty_df = _get_nifty_5m_df()
+        nifty_state = get_nifty_market_state(nifty_df) if nifty_df is not None else {
+            "tradeable_side": "BOTH",
+            "market_confidence_score": 50.0,
+            "market_mode": "CHOPPY",
+        }
+    except Exception as exc:
+        logger.warning("Momentum Pulse market context failed, using neutral filter: %s", exc)
+        nifty_state = {"tradeable_side": "BOTH", "market_confidence_score": 50.0, "market_mode": "CHOPPY"}
 
     # Fetch sector momentum data once for sector-relative scoring
     sector_data: Optional[Dict[str, Any]] = None
@@ -1517,6 +1614,10 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
                 results.append(row)
         del raw  # Explicitly release the batch DataFrame before loading the next batch
         gc.collect()
+
+    breadth = get_market_breadth(results)
+    market_filter = get_combined_market_filter(nifty_state, breadth, benchmark_change_pct)
+    results = _apply_market_filter_to_results(results, market_filter, breadth)
 
     logger.info(
         "Momentum Pulse computed %d names from %d successful batches out of %d (candidates=%d, source=%d).",

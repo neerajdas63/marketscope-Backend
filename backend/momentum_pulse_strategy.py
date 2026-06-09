@@ -155,6 +155,7 @@ def _extract_warning_flags(row: Dict[str, Any]) -> List[str]:
 def _major_risk_flags(row: Dict[str, Any]) -> List[str]:
     warning_flags = _extract_warning_flags(row)
     risks: List[str] = []
+    direction = _safe_str(row.get("direction", row.get("trade_side"))).upper()
 
     if _has_text_item(warning_flags, "farfromvwap") or _has_text_item(warning_flags, "far_from_vwap"):
         risks.append("far_from_vwap")
@@ -184,6 +185,15 @@ def _major_risk_flags(row: Dict[str, Any]) -> List[str]:
         risks.append("nifty_diverging")
     if _safe_float(row.get("or_tightness_pct")) > 2.0 or _has_text_item(warning_flags, "wide_or_range"):
         risks.append("wide_or_range")
+    if (
+        (direction == "LONG" and row.get("market_filter_passed") is False)
+        or (direction == "LONG" and _has_text_item(warning_flags, "market_against_long"))
+        or (direction == "SHORT" and row.get("market_filter_passed") is False)
+        or (direction == "SHORT" and _has_text_item(warning_flags, "market_against_short"))
+    ):
+        risks.append("market_against_trade")
+    if _has_text_item(warning_flags, "skip_day_choppy"):
+        risks.append("skip_day_signal")
 
     behavior_state = _safe_str(row.get("behaviorstate", row.get("behavior_state"))).upper()
     if behavior_state == "EXTENDED":
@@ -364,6 +374,30 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "eligible_time_window": in_early_window,
             "score": 0.0,
             "reasons": ["Nifty moving strongly against trade direction"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
+        }
+
+    if "skip_day_signal" in risks:
+        return {
+            "trade_side": "NO_TRADE",
+            "grade": "NO_TRADE",
+            "eligible_time_window": in_early_window,
+            "score": 0.0,
+            "reasons": ["Market choppy today - no clear direction"],
+            "signal_freshness": signal_freshness,
+            "signal_age_minutes": signal_age_minutes,
+            "reversal_flags": reversal_flags,
+        }
+
+    if "market_against_trade" in risks and nifty_alignment < 40:
+        return {
+            "trade_side": "NO_TRADE",
+            "grade": "NO_TRADE",
+            "eligible_time_window": in_early_window,
+            "score": 0.0,
+            "reasons": ["Market direction against this trade"],
             "signal_freshness": signal_freshness,
             "signal_age_minutes": signal_age_minutes,
             "reversal_flags": reversal_flags,
@@ -913,6 +947,8 @@ def _execution_rank(
     nifty_alignment_score: float = 50.0,
     follow_through: bool = False,
     fake_breakout: bool = False,
+    market_filter_passed: bool = False,
+    market_confidence: float = 50.0,
 ) -> float:
     side = _safe_str(trade_side).upper()
     normalized_grade = _safe_str(grade).upper()
@@ -977,6 +1013,14 @@ def _execution_rank(
         score -= 6.0
     if "wide_or_range" in risk_set:
         score -= 5.0
+    if "market_against_trade" in risk_set:
+        score -= 15.0
+    if "skip_day_signal" in risk_set:
+        score -= 20.0
+    if market_filter_passed:
+        score += 5.0
+    if _safe_float(market_confidence) >= 75:
+        score += 3.0
 
     risk_weights = {
         "far_from_vwap": 10.0,
@@ -1062,6 +1106,8 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
     nifty_alignment_score = _safe_float(row.get("nifty_alignment_score", 50.0))
     follow_through = _safe_bool(row.get("follow_through_confirmed"))
     fake_breakout = _safe_bool(row.get("fake_breakout_detected"))
+    market_filter_passed = _safe_bool(row.get("market_filter_passed"))
+    market_confidence = _safe_float(row.get("market_confidence", 50.0))
     risks = _major_risk_flags(result)
     reversal_flags = list(result.get("reversal_flags") or _reversal_guard_flags(row, trade_side))
     signal_freshness = _safe_str(result.get("signal_freshness", row.get("signal_freshness", "UNKNOWN"))).upper()
@@ -1102,6 +1148,8 @@ def build_strategy_row(row: Dict[str, Any]) -> Dict[str, Any]:
         nifty_alignment_score=nifty_alignment_score,
         follow_through=follow_through,
         fake_breakout=fake_breakout,
+        market_filter_passed=market_filter_passed,
+        market_confidence=market_confidence,
     )
 
     result["signal_bar_time"] = _safe_str(row.get("signal_bar_time", result.get("scan_time")))
@@ -1249,6 +1297,11 @@ def _thin_row_for_bucket(row: Dict[str, Any]) -> Dict[str, Any]:
         "fake_breakout_detected": _safe_bool(row.get("fake_breakout_detected")),
         "nifty_alignment_score": _safe_float(row.get("nifty_alignment_score", 50.0)),
         "or_tightness_pct": _safe_float(row.get("or_tightness_pct")),
+        "market_mode": _safe_str(row.get("market_mode")),
+        "market_confidence": _safe_float(row.get("market_confidence")),
+        "market_filter_passed": _safe_bool(row.get("market_filter_passed")),
+        "market_breadth_signal": _safe_str(row.get("market_breadth_signal")),
+        "market_preferred_side": _safe_str(row.get("market_preferred_side")),
         "entry_price": row.get("entry_price"),
         "stop_loss": row.get("stop_loss"),
         "target_1": row.get("target_1"),
@@ -1283,6 +1336,8 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         and abs(_safe_float(r.get("change_pct_at_scan", r.get("change_pct")))) >= 1.0
         and _safe_float(r.get("breakout_quality_score", 0)) >= 70
         and not _safe_bool(r.get("fake_breakout_detected"))
+        and _safe_bool(r.get("market_filter_passed"))
+        and "skip_day_signal" not in {str(x).strip().lower() for x in (r.get("major_risks") or [])}
         and _safe_str(r.get("trade_side")).upper() in {"LONG", "SHORT"}
         and _safe_str(r.get("grade")).upper() in {"A_PLUS", "A"}
     ]
@@ -1305,8 +1360,21 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if _safe_str(r.get("entry_state")).upper() in {"AVOID_CHASE", "CANCEL_SETUP"}
         or _safe_str(r.get("grade")).upper() in {"FAILED_OR_CHOP", "NO_TRADE"}
     ][:12]
+    first_row = ordered[0] if ordered else {}
+    skip_day = any(
+        _safe_bool(row.get("market_skip_day"))
+        or "skip_day_choppy" in {str(flag).strip().lower() for flag in _extract_warning_flags(row)}
+        or "skip_day_signal" in {str(risk).strip().lower() for risk in (row.get("major_risks") or [])}
+        for row in ordered
+    )
 
     return {
+        "market_context": {
+            "market_mode": _safe_str(first_row.get("market_mode")),
+            "skip_day": bool(skip_day),
+            "preferred_side": _safe_str(first_row.get("market_preferred_side")),
+            "confidence": _safe_float(first_row.get("market_confidence")),
+        },
         "daily_best": _thin_row_for_bucket(daily_best_candidates[0]) if daily_best_candidates else None,
         "overall_best": overall_best,
         "best_longs": best_longs,
