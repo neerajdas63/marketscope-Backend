@@ -20,7 +20,7 @@ from nse_fetcher import fetch_nse_index_quotes
 from runtime_state import load_json_state, save_json_state
 from upstox_client import get_intraday_history_batch, get_underlying_snapshot
 from stocks import SECTORS as _HEATMAP_SECTORS, FO_STOCKS as _FO_STOCKS
-from market_context import get_combined_market_filter, get_market_breadth, get_nifty_market_state
+from .market_context import get_combined_market_filter, get_market_breadth, get_nifty_market_state
 
 logger = logging.getLogger("momentum_pulse")
 
