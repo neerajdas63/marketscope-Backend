@@ -1415,6 +1415,8 @@ def build_live_strategy_payload(
     status = _safe_str(pulse_result.get("status", "ready"))
     message = _safe_str(pulse_result.get("message"))
     benchmark_change_pct = round(_safe_float(pulse_result.get("benchmark_change_pct")), 2)
+    nifty_data_trusted = _safe_bool(pulse_result.get("nifty_data_trusted"), True)
+    nifty_data_quality = dict(pulse_result.get("nifty_data_quality") or {})
 
     return {
         "feature": "Momentum Pulse Strategy",
@@ -1425,6 +1427,8 @@ def build_live_strategy_payload(
         "last_updated": last_updated,
         "market_data_last_updated": market_data_last_updated,
         "benchmark_change_pct": benchmark_change_pct,
+        "nifty_data_trusted": nifty_data_trusted,
+        "nifty_data_quality": nifty_data_quality,
         "direction": normalized_direction,
         "grade": normalized_grade,
         "rows": filtered_rows,

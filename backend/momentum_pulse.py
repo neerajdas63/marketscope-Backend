@@ -56,6 +56,8 @@ _DEFAULT_PULSE_CACHE: Dict[str, Any] = {
     "computed_at": 0.0,
     "last_updated": "",
     "benchmark_change_pct": 0.0,
+    "nifty_data_trusted": True,
+    "nifty_data_quality": {},
     "results": [],
     "has_completed": False,
     "is_loading": False,
@@ -73,6 +75,7 @@ _pulse_cache: Dict[str, Any] = {
 _score_state: Dict[str, Dict[str, Any]] = (
     dict(_persisted_runtime.get("score_state") or {}) if MOMENTUM_PULSE_PERSIST_SCORE_STATE else {}
 )
+_last_nifty_data_quality: Dict[str, Any] = {"change_pct": 0.0, "trusted": True, "reason": "Not checked yet"}
 _lock = threading.Lock()
 
 
@@ -86,6 +89,8 @@ def _persist_runtime_state() -> None:
                     "computed_at": _safe_float(_pulse_cache.get("computed_at")),
                     "last_updated": str(_pulse_cache.get("last_updated") or ""),
                     "benchmark_change_pct": _safe_float(_pulse_cache.get("benchmark_change_pct")),
+                    "nifty_data_trusted": bool(_pulse_cache.get("nifty_data_trusted", True)),
+                    "nifty_data_quality": dict(_pulse_cache.get("nifty_data_quality") or {}),
                     "results": list(_pulse_cache.get("results") or []) if MOMENTUM_PULSE_PERSIST_RESULTS else [],
                     "has_completed": bool(_pulse_cache.get("has_completed")),
                     "is_loading": bool(_pulse_cache.get("is_loading")),
@@ -124,6 +129,8 @@ def _snapshot_cache() -> Dict[str, Any]:
             "computed_at": _safe_float(_pulse_cache.get("computed_at")),
             "last_updated": str(_pulse_cache.get("last_updated") or ""),
             "benchmark_change_pct": _safe_float(_pulse_cache.get("benchmark_change_pct")),
+            "nifty_data_trusted": bool(_pulse_cache.get("nifty_data_trusted", True)),
+            "nifty_data_quality": dict(_pulse_cache.get("nifty_data_quality") or {}),
             "results": list(_pulse_cache.get("results") or []),
             "has_completed": bool(_pulse_cache.get("has_completed")),
             "is_loading": bool(_pulse_cache.get("is_loading")),
@@ -1084,22 +1091,98 @@ def _build_warning_flags(
     return warning_flags
 
 
+def _is_live_market_time() -> bool:
+    now_time = datetime.now(IST).time()
+    return dt_time(9, 15) <= now_time <= dt_time(15, 30)
+
+
+def _is_suspicious_zero_change(change_pct: float) -> bool:
+    return _is_live_market_time() and abs(_safe_float(change_pct)) < 0.01
+
+
+def verify_nifty_data_quality(change_pct: float) -> Dict[str, Any]:
+    change = round(_safe_float(change_pct), 2)
+    suspicious_zero = _is_suspicious_zero_change(change)
+    extreme = abs(change) > 5.0
+    trusted = not suspicious_zero and not extreme and abs(change) >= 0.01
+    if suspicious_zero:
+        reason = "Suspicious zero Nifty change during live market hours"
+    elif extreme:
+        reason = "Extreme Nifty change outside realistic intraday bounds"
+    elif trusted:
+        reason = "Nifty change is realistic"
+    else:
+        reason = "Nifty change is zero outside live market hours"
+    return {
+        "change_pct": change,
+        "trusted": trusted,
+        "suspicious_zero": suspicious_zero,
+        "extreme": extreme,
+        "reason": reason,
+    }
+
+
+def _niftybees_change_from_upstox() -> Tuple[float, Dict[str, Any]]:
+    symbol = "NIFTYBEES.NS"
+    from_date = (datetime.now(IST).date() - pd.Timedelta(days=5)).isoformat()
+    to_date = datetime.now(IST).date().isoformat()
+    raw = _download_intraday_batch_for_range([symbol], from_date=from_date, to_date=to_date)
+    niftybees_df = _get_sym_df(raw, symbol)
+    sessions = _split_sessions(niftybees_df)
+    detail: Dict[str, Any] = {
+        "symbol": symbol,
+        "instrument_key": "NSE_EQ|INE060M01027",
+        "rows": 0 if niftybees_df is None else len(niftybees_df),
+        "sessions": len(sessions),
+        "change_pct": 0.0,
+    }
+    if len(sessions) >= 2:
+        current_close = _safe_float(sessions[-1][1]["Close"].dropna().iloc[-1])
+        prev_close = _safe_float(sessions[-2][1]["Close"].dropna().iloc[-1])
+        detail["current_close"] = current_close
+        detail["prev_close"] = prev_close
+        if current_close > 0 and prev_close > 0:
+            change = round(((current_close - prev_close) / prev_close) * 100.0, 2)
+            detail["change_pct"] = change
+            return change, detail
+    return 0.0, detail
+
+
 def _nifty_change_from_sources(raw: Optional[pd.DataFrame]) -> float:
     try:
         snapshot = get_underlying_snapshot("NIFTY")
         last_price = _safe_float(snapshot.get("last_price"))
         prev_close = _safe_float(snapshot.get("prev_close"))
+        change = round(((last_price - prev_close) / prev_close) * 100.0, 2) if last_price > 0 and prev_close > 0 else 0.0
+        logger.info(
+            "NIFTY_DEBUG source=upstox_snapshot raw=%s last_price=%s prev_close=%s change_pct=%s",
+            snapshot,
+            last_price,
+            prev_close,
+            change,
+        )
         if last_price > 0 and prev_close > 0:
-            return round(((last_price - prev_close) / prev_close) * 100.0, 2)
+            if _is_suspicious_zero_change(change):
+                logger.warning("NIFTY_DEBUG source=upstox_snapshot returned suspicious zero change; skipping source")
+            else:
+                logger.info("NIFTY_DEBUG source=upstox_snapshot status=OK change_pct=%s", change)
+                return change
     except Exception as exc:
         logger.warning("Momentum Pulse Upstox Nifty snapshot failed, using fallback: %s", exc)
 
     try:
         quotes = fetch_nse_index_quotes()
+        logger.info("NIFTY_DEBUG source=nse_quotes available_keys=%s", list((quotes or {}).keys()))
         for key in ("NIFTY 50", "NIFTY50", "NIFTY 50 PR 2X LEV", "NIFTY"):
             quote = quotes.get(key)
+            logger.info("NIFTY_DEBUG source=nse_quotes key=%s value=%s", key, quote)
             if quote and quote.get("percentChange") is not None:
-                return round(_safe_float(quote.get("percentChange")), 2)
+                change = round(_safe_float(quote.get("percentChange")), 2)
+                if _is_suspicious_zero_change(change):
+                    logger.warning("NIFTY_DEBUG source=nse_quotes key=%s returned suspicious zero change; skipping source", key)
+                    continue
+                logger.info("NIFTY_DEBUG source=nse_quotes status=OK key=%s change_pct=%s", key, change)
+                return change
     except Exception as exc:
         logger.warning("Momentum Pulse Nifty quote fetch failed, using history fallback: %s", exc)
 
@@ -1120,11 +1203,40 @@ def _nifty_change_from_sources(raw: Optional[pd.DataFrame]) -> float:
 
     nifty_df = _get_sym_df(raw, "^NSEI")
     sessions = _split_sessions(nifty_df)
+    logger.info(
+        "NIFTY_DEBUG source=yfinance rows=%d sessions=%d",
+        0 if nifty_df is None else len(nifty_df),
+        len(sessions),
+    )
     if len(sessions) >= 2:
         current_close = _safe_float(sessions[-1][1]["Close"].dropna().iloc[-1])
         prev_close = _safe_float(sessions[-2][1]["Close"].dropna().iloc[-1])
         if current_close > 0 and prev_close > 0:
-            return round(((current_close - prev_close) / prev_close) * 100.0, 2)
+            change = round(((current_close - prev_close) / prev_close) * 100.0, 2)
+            logger.info(
+                "NIFTY_DEBUG source=yfinance current_close=%s prev_close=%s change_pct=%s",
+                current_close,
+                prev_close,
+                change,
+            )
+            if _is_suspicious_zero_change(change):
+                logger.warning("NIFTY_DEBUG source=yfinance returned suspicious zero change; skipping source")
+            else:
+                logger.info("NIFTY_DEBUG source=yfinance status=OK change_pct=%s", change)
+                return change
+
+    try:
+        change, detail = _niftybees_change_from_upstox()
+        logger.info("NIFTY_DEBUG source=niftybees detail=%s", detail)
+        if change and not _is_suspicious_zero_change(change):
+            logger.info("NIFTY_DEBUG source=niftybees status=OK change_pct=%s", change)
+            return change
+        if _is_suspicious_zero_change(change):
+            logger.warning("NIFTY_DEBUG source=niftybees returned suspicious zero change; skipping source")
+    except Exception as exc:
+        logger.warning("Momentum Pulse NIFTYBEES fallback failed: %s", exc)
+
+    logger.warning("NIFTY_DEBUG all sources failed or returned suspicious zero; returning 0.0 for quality gate")
     return 0.0
 
 
@@ -1558,7 +1670,26 @@ def _compute_momentum_pulse(scanner_stocks: List[Dict[str, Any]]) -> Tuple[List[
     if not symbols_ns:
         return [], 0.0
 
+    global _last_nifty_data_quality
     benchmark_change_pct = _nifty_change_from_sources(None)
+    nifty_quality = verify_nifty_data_quality(benchmark_change_pct)
+    if not bool(nifty_quality.get("trusted")):
+        logger.error(
+            "NIFTY_DEBUG Nifty data quality check failed; falling back to neutral mode. quality=%s",
+            nifty_quality,
+        )
+        benchmark_change_pct = 0.31
+        nifty_quality = {
+            **nifty_quality,
+            "original_change_pct": nifty_quality.get("change_pct"),
+            "change_pct": benchmark_change_pct,
+            "trusted": False,
+            "fallback_applied": True,
+            "reason": f"{nifty_quality.get('reason')}; fallback benchmark 0.31 applied",
+        }
+    else:
+        nifty_quality = {**nifty_quality, "fallback_applied": False}
+    _last_nifty_data_quality = dict(nifty_quality)
     try:
         nifty_df = _get_nifty_5m_df()
         nifty_state = get_nifty_market_state(nifty_df) if nifty_df is not None else {
@@ -1651,6 +1782,8 @@ def _refresh_momentum_pulse_cache(source_key: str, scanner_stocks: List[Dict[str
             _pulse_cache["computed_at"] = time.time()
             _pulse_cache["last_updated"] = pulse_last_updated
             _pulse_cache["benchmark_change_pct"] = benchmark_change_pct
+            _pulse_cache["nifty_data_trusted"] = bool(_last_nifty_data_quality.get("trusted", True))
+            _pulse_cache["nifty_data_quality"] = dict(_last_nifty_data_quality)
             _pulse_cache["results"] = results
             _pulse_cache["has_completed"] = True
             _pulse_cache["error"] = ""
@@ -1661,6 +1794,8 @@ def _refresh_momentum_pulse_cache(source_key: str, scanner_stocks: List[Dict[str
                 "last_updated": pulse_last_updated,
                 "market_data_last_updated": market_data_last_updated,
                 "benchmark_change_pct": benchmark_change_pct,
+                "nifty_data_trusted": bool(_last_nifty_data_quality.get("trusted", True)),
+                "nifty_data_quality": dict(_last_nifty_data_quality),
                 "status": "ready",
             }
             from backend.momentum_pulse_strategy import build_live_strategy_payload
@@ -1731,6 +1866,8 @@ def get_momentum_pulse_cache_status() -> Dict[str, Any]:
         "error": snapshot["error"],
         "total_cached": len(snapshot["results"]),
         "has_completed": snapshot["has_completed"],
+        "nifty_data_trusted": bool(snapshot.get("nifty_data_trusted", True)),
+        "nifty_data_quality": dict(snapshot.get("nifty_data_quality") or {}),
     }
 
 
@@ -1793,6 +1930,8 @@ def get_momentum_pulse(
             "direction": normalized_direction,
             "include_veryweak": include_veryweak,
             "benchmark_change_pct": round(cached_benchmark, 2),
+            "nifty_data_trusted": bool(snapshot.get("nifty_data_trusted", True)),
+            "nifty_data_quality": dict(snapshot.get("nifty_data_quality") or {}),
             "is_loading": False,
             "status": "ready",
         }
@@ -1813,6 +1952,8 @@ def get_momentum_pulse(
         "direction": normalized_direction,
         "include_veryweak": include_veryweak,
         "benchmark_change_pct": round(cached_benchmark, 2),
+        "nifty_data_trusted": bool(snapshot.get("nifty_data_trusted", True)),
+        "nifty_data_quality": dict(snapshot.get("nifty_data_quality") or {}),
         "is_loading": bool(_snapshot_cache().get("is_loading")),
         "status": status,
         "message": cache_error or ("Momentum Pulse cache is warming up" if not has_completed else "Momentum Pulse refresh is running in background" if has_any_cached_results and should_refresh else "No discovery names matched the current filters yet" if not has_any_cached_results else ""),
@@ -1845,3 +1986,98 @@ def get_daily_best_stock(results: List[Dict[str, Any]]) -> Optional[Dict[str, An
         reverse=True,
     )
     return candidates[0]
+
+
+def debug_nifty_sources() -> Dict[str, Any]:
+    """Manually test all Nifty benchmark sources and report data-quality status."""
+    diagnostics: Dict[str, Any] = {}
+
+    try:
+        snapshot = get_underlying_snapshot("NIFTY")
+        last_price = _safe_float(snapshot.get("last_price"))
+        prev_close = _safe_float(snapshot.get("prev_close"))
+        change = round(((last_price - prev_close) / prev_close) * 100.0, 2) if last_price > 0 and prev_close > 0 else 0.0
+        diagnostics["upstox_snapshot"] = {
+            "status": "OK" if last_price > 0 and prev_close > 0 else "NO_DATA",
+            "raw": snapshot,
+            "last_price": last_price,
+            "prev_close": prev_close,
+            "change_pct": change,
+            "quality": verify_nifty_data_quality(change),
+        }
+    except Exception as exc:
+        diagnostics["upstox_snapshot"] = {"status": "ERROR", "error": str(exc)}
+
+    try:
+        quotes = fetch_nse_index_quotes()
+        selected_key = ""
+        selected_quote = None
+        change = 0.0
+        for key in ("NIFTY 50", "NIFTY50", "NIFTY 50 PR 2X LEV", "NIFTY"):
+            quote = quotes.get(key)
+            if quote and quote.get("percentChange") is not None:
+                selected_key = key
+                selected_quote = quote
+                change = round(_safe_float(quote.get("percentChange")), 2)
+                break
+        diagnostics["nse_quotes"] = {
+            "status": "OK" if selected_quote else "NO_DATA",
+            "available_keys": list((quotes or {}).keys()),
+            "selected_key": selected_key,
+            "selected_quote": selected_quote,
+            "change_pct": change,
+            "quality": verify_nifty_data_quality(change),
+        }
+    except Exception as exc:
+        diagnostics["nse_quotes"] = {"status": "ERROR", "error": str(exc)}
+
+    try:
+        raw = yf.download(
+            tickers="^NSEI",
+            period="5d",
+            interval="5m",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=15,
+        )
+        nifty_df = _get_sym_df(raw, "^NSEI")
+        sessions = _split_sessions(nifty_df)
+        change = 0.0
+        current_close = 0.0
+        prev_close = 0.0
+        if len(sessions) >= 2:
+            current_close = _safe_float(sessions[-1][1]["Close"].dropna().iloc[-1])
+            prev_close = _safe_float(sessions[-2][1]["Close"].dropna().iloc[-1])
+            if current_close > 0 and prev_close > 0:
+                change = round(((current_close - prev_close) / prev_close) * 100.0, 2)
+        diagnostics["yfinance_nsei"] = {
+            "status": "OK" if change != 0.0 else "NO_DATA_OR_ZERO",
+            "rows": 0 if nifty_df is None else len(nifty_df),
+            "sessions": len(sessions),
+            "current_close": current_close,
+            "prev_close": prev_close,
+            "change_pct": change,
+            "quality": verify_nifty_data_quality(change),
+        }
+    except Exception as exc:
+        diagnostics["yfinance_nsei"] = {"status": "ERROR", "error": str(exc)}
+
+    try:
+        change, detail = _niftybees_change_from_upstox()
+        diagnostics["niftybees_upstox"] = {
+            "status": "OK" if change != 0.0 else "NO_DATA_OR_ZERO",
+            **detail,
+            "quality": verify_nifty_data_quality(change),
+        }
+    except Exception as exc:
+        diagnostics["niftybees_upstox"] = {"status": "ERROR", "error": str(exc)}
+
+    final_change = _nifty_change_from_sources(None)
+    final_quality = verify_nifty_data_quality(final_change)
+    diagnostics["final_result"] = {
+        "change_pct": final_change,
+        "quality": final_quality,
+        "status": "WORKING" if final_quality.get("trusted") else "BROKEN",
+    }
+    return diagnostics
