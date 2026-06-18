@@ -117,6 +117,12 @@ def get_nifty_market_state(nifty_5m_df: pd.DataFrame) -> Dict[str, Any]:
     elif was_up and recent_fading and vwap_position == "BELOW":
         market_mode = "FADING"
         tradeable_side = "BOTH"
+    elif session_change_pct > 0.2:
+        market_mode = "MILD_UPTREND"
+        tradeable_side = "LONG_ONLY"
+    elif session_change_pct < -0.2:
+        market_mode = "MILD_DOWNTREND"
+        tradeable_side = "SHORT_ONLY"
     else:
         market_mode = "CHOPPY"
         tradeable_side = "SKIP"
@@ -136,7 +142,14 @@ def get_nifty_market_state(nifty_5m_df: pd.DataFrame) -> Dict[str, Any]:
     aligned_count = max(sum(bullish_aligned), sum(bearish_aligned))
     confidence_by_count = {4: 90.0, 3: 70.0, 2: 45.0, 1: 22.0, 0: 15.0}
     confidence = confidence_by_count.get(aligned_count, 20.0)
-    if abs(session_change_pct) > 0.5 and aligned_count >= 3:
+    abs_change = abs(session_change_pct)
+    if abs_change > 1.0:
+        confidence = max(confidence, 82.0)
+    elif abs_change > 0.5:
+        confidence = max(confidence, 68.0)
+    elif abs_change > 0.2:
+        confidence = max(confidence, 55.0)
+    if abs_change > 0.5 and aligned_count >= 3:
         confidence = min(100.0, confidence + 8.0)
 
     skip_reason = ""
@@ -225,7 +238,8 @@ def get_combined_market_filter(
     else:
         quality_multiplier = 0.85
 
-    if -0.3 <= _safe_float(nifty_change_pct) <= 0.3:
+    nifty_change = _safe_float(nifty_change_pct)
+    if -0.2 <= nifty_change <= 0.2:
         return {
             "allow_long": False,
             "allow_short": False,
@@ -237,6 +251,38 @@ def get_combined_market_filter(
             "min_rs_for_long": 2.0,
             "min_rs_for_short": -2.0,
             "market_mode": "CHOPPY",
+            "breadth_signal": breadth_signal,
+        }
+
+    if tradeable_side == "SKIP" and nifty_change > 0.2:
+        confidence = max(confidence, 55.0 if nifty_change <= 0.5 else 68.0 if nifty_change <= 1.0 else 82.0)
+        return {
+            "allow_long": True,
+            "allow_short": False,
+            "skip_day": False,
+            "preferred_side": "LONG",
+            "reason": "Nifty mild uptrend - long side allowed",
+            "confidence": confidence,
+            "quality_multiplier": 1.0 if confidence < 75 else 1.15,
+            "min_rs_for_long": 0.5,
+            "min_rs_for_short": -2.0,
+            "market_mode": "MILD_UPTREND",
+            "breadth_signal": breadth_signal,
+        }
+
+    if tradeable_side == "SKIP" and nifty_change < -0.2:
+        confidence = max(confidence, 55.0 if abs(nifty_change) <= 0.5 else 68.0 if abs(nifty_change) <= 1.0 else 82.0)
+        return {
+            "allow_long": False,
+            "allow_short": True,
+            "skip_day": False,
+            "preferred_side": "SHORT",
+            "reason": "Nifty mild downtrend - short side allowed",
+            "confidence": confidence,
+            "quality_multiplier": 1.0 if confidence < 75 else 1.15,
+            "min_rs_for_long": 2.0,
+            "min_rs_for_short": -0.5,
+            "market_mode": "MILD_DOWNTREND",
             "breadth_signal": breadth_signal,
         }
 

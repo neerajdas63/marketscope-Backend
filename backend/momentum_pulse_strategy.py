@@ -293,6 +293,7 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     rank_grade = _safe_int(row.get("rank_grade"))
     risks = _major_risk_flags(row)
     reversal_flags = _reversal_guard_flags(row, direction)
+    skip_day_warning = "skip_day_signal" in risks
 
     if direction not in {"LONG", "SHORT"}:
         return {
@@ -374,18 +375,6 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
             "eligible_time_window": in_early_window,
             "score": 0.0,
             "reasons": ["Nifty moving strongly against trade direction"],
-            "signal_freshness": signal_freshness,
-            "signal_age_minutes": signal_age_minutes,
-            "reversal_flags": reversal_flags,
-        }
-
-    if "skip_day_signal" in risks:
-        return {
-            "trade_side": "NO_TRADE",
-            "grade": "NO_TRADE",
-            "eligible_time_window": in_early_window,
-            "score": 0.0,
-            "reasons": ["Market choppy today - no clear direction"],
             "signal_freshness": signal_freshness,
             "signal_age_minutes": signal_age_minutes,
             "reversal_flags": reversal_flags,
@@ -528,6 +517,12 @@ def classify_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     output_reasons.extend([r for r in reasons if str(r).strip()])
     if reversal_flags:
         output_reasons.append("Soft fade warning: " + ", ".join(reversal_flags))
+
+    if skip_day_warning and grade == "A_PLUS":
+        grade = "A"
+
+    if skip_day_warning:
+        output_reasons.append("Caution: Market choppy today - trade with reduced size")
 
     return {
         "trade_side": direction,
@@ -1336,8 +1331,7 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         and abs(_safe_float(r.get("change_pct_at_scan", r.get("change_pct")))) >= 1.0
         and _safe_float(r.get("breakout_quality_score", 0)) >= 70
         and not _safe_bool(r.get("fake_breakout_detected"))
-        and _safe_bool(r.get("market_filter_passed"))
-        and "skip_day_signal" not in {str(x).strip().lower() for x in (r.get("major_risks") or [])}
+        and _safe_bool(r.get("follow_through_confirmed"))
         and _safe_str(r.get("trade_side")).upper() in {"LONG", "SHORT"}
         and _safe_str(r.get("grade")).upper() in {"A_PLUS", "A"}
     ]
@@ -1368,6 +1362,14 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         for row in ordered
     )
 
+    daily_best_row = _thin_row_for_bucket(daily_best_candidates[0]) if daily_best_candidates else None
+    if daily_best_row is not None and daily_best_candidates:
+        daily_best_row["market_warning"] = (
+            "Skip Day - trade with extra caution"
+            if "skip_day_signal" in {str(x).strip().lower() for x in (daily_best_candidates[0].get("major_risks") or [])}
+            else ""
+        )
+
     return {
         "market_context": {
             "market_mode": _safe_str(first_row.get("market_mode")),
@@ -1375,7 +1377,7 @@ def build_best_stock_buckets(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "preferred_side": _safe_str(first_row.get("market_preferred_side")),
             "confidence": _safe_float(first_row.get("market_confidence")),
         },
-        "daily_best": _thin_row_for_bucket(daily_best_candidates[0]) if daily_best_candidates else None,
+        "daily_best": daily_best_row,
         "overall_best": overall_best,
         "best_longs": best_longs,
         "best_shorts": best_shorts,

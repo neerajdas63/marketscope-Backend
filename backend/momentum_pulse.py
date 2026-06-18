@@ -30,6 +30,7 @@ MAX_HISTORY_POINTS = 24
 REFRESH_COOLDOWN_SECONDS = max(5, int(os.getenv("REFRESH_COOLDOWN_SECONDS", "20")))
 MIN_SESSION_BARS = 1
 TREND_WEIGHT = 0.07
+OR_SCORING_CUTOFF = dt_time(10, 0)
 LOW_RESOURCE_MODE = str(os.getenv("LOW_RESOURCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 MOMENTUM_PULSE_MAX_SYMBOLS = max(0, int(os.getenv("MOMENTUM_PULSE_MAX_SYMBOLS", "90" if LOW_RESOURCE_MODE else "0")))
 MOMENTUM_PULSE_BATCH_SIZE = max(10, int(os.getenv("MOMENTUM_PULSE_BATCH_SIZE", "20" if LOW_RESOURCE_MODE else "30")))
@@ -651,12 +652,6 @@ def calculate_breakout_quality(
             break
 
     if breakout_idx is None:
-        if live_price > or_high * 1.001:
-            default["breakout_side"] = "LONG"
-            default["breakout_confirmed"] = True
-        elif live_price < or_low * 0.999:
-            default["breakout_side"] = "SHORT"
-            default["breakout_confirmed"] = True
         return default
 
     breakout_row = rows[breakout_idx][1]
@@ -773,15 +768,15 @@ def calculate_nifty_alignment_score(
     side = str(direction or "").upper()
     nifty_change = _safe_float(nifty_change_pct)
     if side == "LONG":
-        if nifty_change > 0.3:
+        if nifty_change > 0.5:
             return 85.0
-        if nifty_change < -0.3:
+        if nifty_change < -0.5:
             return 20.0
         return 50.0
     if side == "SHORT":
-        if nifty_change < -0.3:
+        if nifty_change < -0.5:
             return 85.0
-        if nifty_change > 0.3:
+        if nifty_change > 0.5:
             return 20.0
         return 50.0
     return 50.0
@@ -1260,12 +1255,26 @@ def _evaluate_symbol(
         return None
     session_bar_count = len(session_df)
 
+    # ── OR-window scoring filter ─────────────────────────────────────────────
+    # When current IST time is after 10:00 AM, restrict scoring calculations to
+    # bars up to the opening-range window (≤10:00). If too few bars remain, fall
+    # back to the full session. Before 10:00 AM there is nothing to filter.
+    now_ist = datetime.now(IST)
+    if now_ist.time() >= OR_SCORING_CUTOFF:
+        or_window_df = session_df[session_df.index.time <= OR_SCORING_CUTOFF]
+        if len(or_window_df) >= MIN_SESSION_BARS:
+            scoring_df = or_window_df
+        else:
+            scoring_df = session_df
+    else:
+        scoring_df = session_df
+
     historical_sessions = sessions[:-1][-LOOKBACK_SESSIONS:]
     if not historical_sessions:
         return None
 
-    latest_ts = session_df.index[-1]
-    cutoff = _current_cutoff(session_df)
+    latest_ts = scoring_df.index[-1]
+    cutoff = scoring_df.index[-1].time()
     live_price = _safe_float(stock.get("ltp"), _safe_float(session_df["Close"].iloc[-1]))
     if live_price <= 0:
         return None
@@ -1277,7 +1286,7 @@ def _evaluate_symbol(
     change_pct = _safe_float(stock.get("change_pct"), round(((live_price - current_prev_close) / current_prev_close) * 100.0, 2))
 
     today_cum_volume, avg_20d_cum_volume_same_time, volume_pace_ratio, volume_pace_score = calculate_same_time_cum_volume_baseline(
-        session_df,
+        scoring_df,
         historical_sessions,
         cutoff,
     )
@@ -1289,26 +1298,26 @@ def _evaluate_symbol(
         range_expansion_ratio,
         range_expansion_score,
     ) = calculate_same_time_range_baseline(
-        session_df,
+        scoring_df,
         historical_sessions,
         cutoff,
         current_prev_close,
     )
     relative_strength, long_rs_score, short_rs_score = calculate_relative_strength_scores(change_pct, nifty_change_pct)
-    long_consistency, short_consistency, one_bar_spike = calculate_directional_consistency(session_df)
+    long_consistency, short_consistency, one_bar_spike = calculate_directional_consistency(scoring_df)
     vwap, distance_from_vwap_pct, long_vwap_score, short_vwap_score, is_extended = calculate_vwap_alignment(
-        session_df,
+        scoring_df,
         live_price,
         _safe_float(stock.get("vwap")),
     )
 
     # ── New quality components ────────────────────────────────────────────────
-    vol_consistency_score, vol_above_count, vol_total_bars = calculate_volume_consistency(session_df)
+    vol_consistency_score, vol_above_count, vol_total_bars = calculate_volume_consistency(scoring_df)
     sector_rel, long_sector_score, short_sector_score, sector_name = calculate_sector_relative_strength(
         change_pct, str(stock.get("symbol") or ""), sector_data,
     )
     or_high, or_low, or_position_pct, long_or_score, short_or_score = calculate_opening_range_position(
-        session_df, live_price,
+        scoring_df, live_price,
     )
     breakout_quality = calculate_breakout_quality(
         session_df,
